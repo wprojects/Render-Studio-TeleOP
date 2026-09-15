@@ -1,0 +1,61 @@
+# Local notes (do not commit)
+Notes.md
+**/Notes.md
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.csr
+*.der
+certs/
+**/teleop_certs/
+credentials
+credentials.json
+**/credentials*
+secrets/
+*.secret
+id_rsa
+id_ed25519
+id_ecdsa
+*.token
+gh_token
+.github_token
+GH_TOKEN
+GITHUB_TOKEN
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime, recordings, caches
+user_data/
+recordings/
+logs/
+*.rrd
+recording*.db
+.cache/
+.uv/
+*.log
+
+# Local systemd units (this Pi’s paths)
+*.service
+
+# OS / editor
+.DS_Store
+.vscode/
+*.swp

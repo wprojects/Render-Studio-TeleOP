@@ -1,0 +1,16 @@
+# Render-Studio-TeleOP — Connect API (this repo)
+#
+#   python3 -m pip install -r requirements.txt
+#   python3 connect_api.py
+#
+# Python 3.10+ recommended (DimOS itself needs 3.10–3.12).
+#
+# Robot teleop / OpenArm / Quest is NOT installed from this file.
+# Clone DimOS as a sibling and install it with uv:
+#   cd ../DimOS
+#   curl -LsSf https://astral.sh/uv/install.sh | sh
+#   uv sync
+# See README.md for Peak CAN, Quest, systemd, and full setup.
+
+fastapi>=0.115.6
+uvicorn>=0.34.0
