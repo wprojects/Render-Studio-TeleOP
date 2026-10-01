@@ -1,0 +1,367 @@
+diff --git a/dimos/hardware/whole_body/damiao/adapter.py b/dimos/hardware/whole_body/damiao/adapter.py
+index c85fd452..96972272 100644
+--- a/dimos/hardware/whole_body/damiao/adapter.py
++++ b/dimos/hardware/whole_body/damiao/adapter.py
+@@ -49,6 +49,13 @@ class DamiaoWholeBodyAdapter(ABC):
+     gs_usb_product_id = 0x606F
+     kinematic_joint_names: tuple[str, ...] = ()
+     feedback_clamp_margin_rad = 0.05
++    calibrate_grippers_on_enable = True
++    activation_gripper_opening: float | None = None
++    gripper_control_mode = "pos_force"
++    gripper_command_current = 0.15
++    gripper_command_velocity_rad_s = 0.0
++    gripper_mit_kp = 5.0
++    gripper_mit_kd = 0.3
+ 
+     def __init__(
+         self,
+@@ -129,7 +136,7 @@ class DamiaoWholeBodyAdapter(ABC):
+         index = self._bus_index(name)
+         device = self._runtime_config.bus_devices.get(name)
+         if sys.platform == "linux":
+-            return can_motor_control.SocketCanBus(device or f"can{index}")
++            return can_motor_control.SocketCanBus(device or f"can{index}", fd=True)
+         if sys.platform == "darwin":
+             if device is not None:
+                 return can_motor_control.GsUsbBus(
+@@ -244,14 +251,18 @@ class DamiaoWholeBodyAdapter(ABC):
+             self._preflight_gravity()
+             for arm in self._arms.values():
+                 arm.set_mode("mit")
+-            self._robot.enable()
++            if self.calibrate_grippers_on_enable:
++                self._robot.enable()
++            else:
++                self._enable_motors_without_gripper_calibration()
+             self._active = True
+             self.read_motor_states()
+             return True
+-        except Exception:
++        except Exception as exc:
+             logger.exception(
+                 "Damiao whole-body adapter failed to activate",
+                 hardware_id=self._hardware_id,
++                error=str(exc),
+             )
+             try:
+                 self._robot.disable()
+@@ -307,9 +318,7 @@ class DamiaoWholeBodyAdapter(ABC):
+                 # placeholder so read-only sessions still stream arm state.
+                 states.append(MotorState(q=0.0, dq=0.0, tau=0.0))
+                 continue
+-            opening = float(self._grippers[name].opening)
+-            if not np.isfinite(opening) or not 0.0 <= opening <= 1.0:
+-                raise RuntimeError(f"gripper {name!r} returned invalid opening {opening}")
++            opening = self._read_gripper_opening(name)
+             states.append(MotorState(q=opening, dq=0.0, tau=0.0))
+         self._validate_finite_states(states)
+         return self._normalize_arm_feedback(states)
+@@ -367,8 +376,7 @@ class DamiaoWholeBodyAdapter(ABC):
+                 gravity_offset += count
+ 
+             for name in self.gripper_joints:
+-                opening = commands[offset].q
+-                self._grippers[name].set_opening(opening)
++                self._write_gripper_opening(name, commands[offset].q)
+                 offset += 1
+ 
+             self._robot.tick(self._runtime_config.tick_deadline_us)
+@@ -380,6 +388,76 @@ class DamiaoWholeBodyAdapter(ABC):
+             )
+             return False
+ 
++    def _enable_motors_without_gripper_calibration(self) -> None:
++        """Enable in place, then select gripper mode and apply the start opening."""
++        for arm in self._arms.values():
++            arm.enable_all()
++        for gripper in self._grippers.values():
++            gripper.set_mode(self.gripper_control_mode)
++            gripper.enable()
++        self._refresh()
++        if self.activation_gripper_opening is None:
++            self._hold_current_gripper_positions()
++        else:
++            for name in self.gripper_joints:
++                self._write_gripper_opening(name, self.activation_gripper_opening)
++            self._robot.tick(self._runtime_config.tick_deadline_us)
++
++    def _hold_current_gripper_positions(self) -> None:
++        held = False
++        for gripper in self._grippers.values():
++            pos_force = getattr(gripper, "pos_force_control", None)
++            motor = getattr(gripper, "motor", None)
++            if pos_force is None or motor is None:
++                continue
++            pos_force(float(motor.position), 0.0, self.gripper_command_current)
++            held = True
++        if held:
++            self._robot.tick(self._runtime_config.tick_deadline_us)
++
++    def _read_gripper_opening(self, name: str) -> float:
++        gripper = self._grippers[name]
++        if not self.calibrate_grippers_on_enable:
++            mapped = self._opening_from_motor_position(name)
++            if mapped is not None:
++                return mapped
++        try:
++            opening = float(gripper.opening)
++        except Exception:
++            opening = float("nan")
++        if np.isfinite(opening) and 0.0 <= opening <= 1.0:
++            return opening
++        mapped = self._opening_from_motor_position(name)
++        if mapped is not None:
++            return mapped
++        raise RuntimeError(f"gripper {name!r} returned invalid opening {opening}")
++
++    def _write_gripper_opening(self, name: str, opening: float) -> None:
++        gripper = self._grippers[name]
++        motor_q = self._motor_position_for_opening(name, opening)
++        if motor_q is not None and self.gripper_control_mode == "mit":
++            gripper.mit_control(self.gripper_mit_kp, self.gripper_mit_kd, motor_q, 0.0, 0.0)
++            return
++        pos_force = getattr(gripper, "pos_force_control", None)
++        if motor_q is not None and pos_force is not None:
++            pos_force(motor_q, self.gripper_command_velocity_rad_s, self.gripper_command_current)
++            return
++        gripper.set_opening(opening)
++
++    def _motor_position_for_opening(self, name: str, opening: float) -> float | None:
++        del name, opening
++        return None
++
++    def _opening_from_motor_position(self, name: str) -> float | None:
++        gripper = self._grippers[name]
++        motor = getattr(gripper, "motor", None)
++        closed_q = self._motor_position_for_opening(name, 0.0)
++        open_q = self._motor_position_for_opening(name, 1.0)
++        if motor is None or closed_q is None or open_q is None or closed_q == open_q:
++            return None
++        opening = (float(motor.position) - closed_q) / (open_q - closed_q)
++        return float(np.clip(opening, 0.0, 1.0))
++
+     def _refresh(self) -> None:
+         self._robot.refresh()
+         self._robot.tick(self._runtime_config.tick_deadline_us)
+diff --git a/dimos/hardware/whole_body/damiao/test_adapter.py b/dimos/hardware/whole_body/damiao/test_adapter.py
+index 8345fdde..78f7b7bb 100644
+--- a/dimos/hardware/whole_body/damiao/test_adapter.py
++++ b/dimos/hardware/whole_body/damiao/test_adapter.py
+@@ -41,6 +41,10 @@ class FakeArm:
+         self.command_error: Exception | None = None
+         self.modes: list[str] = []
+         self.commands: list[np.ndarray] = []
++        self.enable_all_count = 0
++
++    def enable_all(self) -> None:
++        self.enable_all_count += 1
+ 
+     def positions(self) -> np.ndarray:
+         return self.position_values
+@@ -62,11 +66,29 @@ class FakeArm:
+         self.commands.append(commands)
+ 
+ 
++class FakeMotor:
++    def __init__(self, position: float) -> None:
++        self.position = position
++
++
+ class FakeGripper:
+-    def __init__(self, opening: float) -> None:
++    def __init__(self, opening: float, position: float = 0.1) -> None:
+         self.opening = opening
+         self.command_error: Exception | None = None
+         self.commands: list[float] = []
++        self.enable_count = 0
++        self.modes: list[str] = []
++        self.pos_force_commands: list[tuple[float, float, float]] = []
++        self.motor = FakeMotor(position)
++
++    def enable(self) -> None:
++        self.enable_count += 1
++
++    def set_mode(self, mode: str) -> None:
++        self.modes.append(mode)
++
++    def pos_force_control(self, q: float, dq: float, i_pu: float) -> None:
++        self.pos_force_commands.append((q, dq, i_pu))
+ 
+     def set_opening(self, opening: float) -> None:
+         if self.command_error is not None:
+@@ -153,6 +175,15 @@ class DualAdapter(DamiaoWholeBodyAdapter):
+         return cast("can_motor_control.Robot", self.fake_robot)
+ 
+ 
++class StartOpenDualAdapter(DualAdapter):
++    calibrate_grippers_on_enable = False
++    activation_gripper_opening = 0.5
++
++    def _motor_position_for_opening(self, name: str, opening: float) -> float:
++        del name
++        return opening
++
++
+ class RebuildingDualAdapter(DualAdapter):
+     def __init__(
+         self,
+@@ -336,7 +367,7 @@ def test_make_can_bus_linux_uses_ordered_defaults(
+ 
+     assert adapter._make_can_bus("left") is socketcan.return_value
+     assert adapter._make_can_bus("right") is socketcan.return_value
+-    assert socketcan.call_args_list == [mocker.call("can0"), mocker.call("can1")]
++    assert socketcan.call_args_list == [mocker.call("can0", fd=True), mocker.call("can1", fd=True)]
+ 
+ 
+ def test_make_can_bus_linux_uses_configured_interface(
+@@ -351,7 +382,7 @@ def test_make_can_bus_linux_uses_configured_interface(
+     )
+ 
+     assert adapter._make_can_bus("left") is socketcan.return_value
+-    socketcan.assert_called_once_with("can8")
++    socketcan.assert_called_once_with("can8", fd=True)
+ 
+ 
+ def test_init_rehydrates_serialized_runtime_config(dual_robot: FakeRobot) -> None:
+@@ -570,6 +601,29 @@ def test_activate_enable_failure_disables_robot(
+     assert dual_robot.disable_count == 1
+ 
+ 
++def test_activate_without_calibration_commands_half_open_after_mode_switch(
++    dual_robot: FakeRobot,
++    mocker: MockerFixture,
++) -> None:
++    mocker.patch.object(StartOpenDualAdapter, "_require_arm", side_effect=lambda robot, name: robot[name])
++    mocker.patch.object(StartOpenDualAdapter, "_require_gripper", side_effect=lambda robot, name: robot[name])
++    adapter = StartOpenDualAdapter(
++        dual_robot,
++        runtime_config=DamiaoRuntimeConfig(gravity_comp=False),
++    )
++    assert adapter.connect()
++    assert adapter.activate()
++
++    assert dual_robot.enable_count == 0
++    for side in ("left", "right"):
++        arm = cast("FakeArm", dual_robot[f"{side}_arm"])
++        gripper = cast("FakeGripper", dual_robot[f"{side}_gripper"])
++        assert arm.enable_all_count == 1
++        assert gripper.enable_count == 1
++        assert gripper.modes == ["pos_force"]
++        assert gripper.pos_force_commands == [(0.5, 0.0, 0.15)]
++
++
+ def test_deactivate_connected_adapter_disables_robot(
+     active_dual_adapter: DualAdapter,
+     dual_robot: FakeRobot,
+diff --git a/dimos/hardware/whole_body/openarm_damiao/adapter.py b/dimos/hardware/whole_body/openarm_damiao/adapter.py
+index af65eeb5..944a4def 100644
+--- a/dimos/hardware/whole_body/openarm_damiao/adapter.py
++++ b/dimos/hardware/whole_body/openarm_damiao/adapter.py
+@@ -22,7 +22,15 @@ from can_motor_control import damiao
+ from dimos.hardware.spec import JointLimits
+ from dimos.hardware.whole_body.damiao.adapter import DamiaoWholeBodyAdapter
+ from dimos.robot.assets.model import RobotModel
+-from dimos.robot.manipulators.openarm.config import OPENARM_BIMANUAL_MODEL
++from dimos.robot.manipulators.openarm.config import (
++    OPENARM_BIMANUAL_MODEL,
++    OPENARM_GRIPPER_CLOSED_POSITION_RAD,
++    OPENARM_GRIPPER_CURRENT,
++    OPENARM_GRIPPER_OPENING_DIRECTION,
++    OPENARM_GRIPPER_REST_OPENING,
++    OPENARM_GRIPPER_SPEED_RAD_S,
++    OPENARM_GRIPPER_TRAVEL_RAD,
++)
+ 
+ 
+ def _arm_motors(side: str) -> list[can_motor_control.MotorSpec]:
+@@ -61,6 +69,12 @@ class OpenArmDamiaoAdapter(DamiaoWholeBodyAdapter):
+     # device overrides can select Linux interfaces or macOS USB serial numbers.
+     bus_names = ("right", "left")
+     kinematic_joint_names = (*arm_joints["left_arm"], *arm_joints["right_arm"])
++    calibrate_grippers_on_enable = False
++    activation_gripper_opening = OPENARM_GRIPPER_REST_OPENING
++    # The installed gripper firmware ignores POS_FORCE packets.
++    gripper_control_mode = "mit"
++    gripper_command_current = OPENARM_GRIPPER_CURRENT
++    gripper_command_velocity_rad_s = OPENARM_GRIPPER_SPEED_RAD_S
+ 
+     def get_limits(self) -> JointLimits:
+         """Declare both grippers in their local normalized opening coordinate."""
+@@ -96,14 +110,20 @@ class OpenArmDamiaoAdapter(DamiaoWholeBodyAdapter):
+                 bus="left",
+                 motor=_gripper_motor("left"),
+                 opening_direction="decreasing_position",
+-                default_current=0.15,
++                default_current=OPENARM_GRIPPER_CURRENT,
+             )
+             .add_gripper(
+                 "right_gripper",
+                 bus="right",
+                 motor=_gripper_motor("right"),
+-                opening_direction="decreasing_position",
+-                default_current=0.15,
++                opening_direction="increasing_position",
++                default_current=OPENARM_GRIPPER_CURRENT,
+             )
+             .build()
+         )
++
++    def _motor_position_for_opening(self, name: str, opening: float) -> float | None:
++        closed = OPENARM_GRIPPER_CLOSED_POSITION_RAD[name]
++        direction = OPENARM_GRIPPER_OPENING_DIRECTION[name]
++        signed = OPENARM_GRIPPER_TRAVEL_RAD if direction == "increasing_position" else -OPENARM_GRIPPER_TRAVEL_RAD
++        return closed + float(opening) * signed
+diff --git a/dimos/hardware/whole_body/openarm_damiao/test_adapter.py b/dimos/hardware/whole_body/openarm_damiao/test_adapter.py
+index b1321e40..4dd1ca53 100644
+--- a/dimos/hardware/whole_body/openarm_damiao/test_adapter.py
++++ b/dimos/hardware/whole_body/openarm_damiao/test_adapter.py
+@@ -29,12 +29,18 @@ from dimos.hardware.whole_body.openarm_damiao.adapter import OpenArmDamiaoAdapte
+ from dimos.robot.manipulators.openarm.config import OPENARM_DOF, OPENARM_JOINTS
+ 
+ 
++def _mock_socket_can_bus(device: str, *args: object, **kwargs: object) -> object:
++    if kwargs.get("fd"):
++        return can_motor_control.MockCanBus.new_fd(device)
++    return can_motor_control.MockCanBus(device)
++
++
+ @pytest.fixture
+ def openarm_adapter(mocker: MockerFixture) -> Iterator[OpenArmDamiaoAdapter]:
+     # Darwin wheels of can_motor_control omit SocketCanBus (SocketCAN is
+     # Linux-only), so create the attribute and force the Linux bus path.
+     mocker.patch.object(
+-        can_motor_control, "SocketCanBus", can_motor_control.MockCanBus, create=True
++        can_motor_control, "SocketCanBus", _mock_socket_can_bus, create=True
+     )
+     mocker.patch.object(damiao_adapter_module.sys, "platform", "linux")
+     adapter = OpenArmDamiaoAdapter(
+diff --git a/dimos/robot/manipulators/openarm/config.py b/dimos/robot/manipulators/openarm/config.py
+index 489aac9f..207871b9 100644
+--- a/dimos/robot/manipulators/openarm/config.py
++++ b/dimos/robot/manipulators/openarm/config.py
+@@ -16,6 +16,8 @@
+ 
+ from __future__ import annotations
+ 
++import math
++
+ from dimos.control.components import HardwareComponent, HardwareType
+ from dimos.hardware.spec import JointLimits
+ from dimos.hardware.whole_body.damiao.config import DamiaoRuntimeConfig
+@@ -71,6 +73,15 @@ OPENARM_ARM_JOINTS = [*OPENARM_LEFT_ARM_JOINTS, *OPENARM_RIGHT_ARM_JOINTS]
+ OPENARM_GRIPPER_JOINTS = ["left_arm/gripper", "right_arm/gripper"]
+ OPENARM_JOINTS = [*OPENARM_ARM_JOINTS, *OPENARM_GRIPPER_JOINTS]
+ OPENARM_HOME_JOINTS = [0.0] * len(OPENARM_ARM_JOINTS)
++OPENARM_GRIPPER_REST_OPENING = 0.5
++OPENARM_GRIPPER_TRAVEL_RAD = math.pi / 2
++OPENARM_GRIPPER_SPEED_RAD_S = 50.0
++OPENARM_GRIPPER_CURRENT = 1.0 / 4.5
++OPENARM_GRIPPER_CLOSED_POSITION_RAD = {"left_gripper": 0.0, "right_gripper": 0.0}
++OPENARM_GRIPPER_OPENING_DIRECTION = {
++    "left_gripper": "decreasing_position",
++    "right_gripper": "increasing_position",
++}
+ OPENARM_GRIPPER_COLLISION_EXCLUSIONS = [
+     (f"openarm_{side}_ee_link1", f"openarm_{side}_ee_link2") for side in OPENARM_SIDES
+ ]

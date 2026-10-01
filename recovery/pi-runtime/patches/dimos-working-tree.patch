@@ -1,0 +1,2370 @@
+diff --git a/dimos/cli/can.py b/dimos/cli/can.py
+index c7f142be..09041364 100644
+--- a/dimos/cli/can.py
++++ b/dimos/cli/can.py
+@@ -16,10 +16,13 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ import os
++import plistlib
+ import shlex
+ import subprocess
+ import sys
++from typing import Any, NamedTuple
+ 
+ import can_motor_control
+ import typer
+@@ -28,6 +31,103 @@ app = typer.Typer(help="Discover and configure CAN interfaces", no_args_is_help=
+ 
+ GS_USB_VENDOR_ID = 0x1D50
+ GS_USB_PRODUCT_ID = 0x606F
++PCAN_USB_PRO_FD_VENDOR_ID = 0x0C72
++PCAN_USB_PRO_FD_PRODUCT_ID = 0x0011
++PCAN_USB_PRO_FD_NAME = "PEAK-System PCAN-USB Pro FD"
++# Dual-channel Pro FD. These are PCANBasic/MacCAN names, not gs_usb serials.
++PCAN_USB_PRO_FD_CHANNELS = ("PCAN_USBBUS1", "PCAN_USBBUS2")
++
++
++class _PcanUsbProFd(NamedTuple):
++    name: str
++    vendor_id: int
++    product_id: int
++    serial_number: str | None
++
++
++def _usb_int(value: object) -> int | None:
++    if isinstance(value, bool) or value is None:
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, str):
++        text = value.strip().split()[0]
++        try:
++            return int(text, 0)
++        except ValueError:
++            return None
++    return None
++
++
++def _iter_ioreg_dicts(node: object) -> Iterator[dict[str, Any]]:
++    if isinstance(node, dict):
++        yield node
++        for value in node.values():
++            yield from _iter_ioreg_dicts(value)
++    elif isinstance(node, list):
++        for value in node:
++            yield from _iter_ioreg_dicts(value)
++
++
++def pcan_usb_pro_fd_from_ioreg(node: object) -> tuple[_PcanUsbProFd, ...]:
++    """Return PCAN-USB Pro FD devices present in an ioreg IOUSB plist."""
++    found: list[_PcanUsbProFd] = []
++    seen: set[tuple[object, str | None]] = set()
++    for entry in _iter_ioreg_dicts(node):
++        vendor_id = _usb_int(entry.get("idVendor") or entry.get("kUSBVendorID"))
++        product_id = _usb_int(entry.get("idProduct") or entry.get("kUSBProductID"))
++        if vendor_id != PCAN_USB_PRO_FD_VENDOR_ID or product_id != PCAN_USB_PRO_FD_PRODUCT_ID:
++            continue
++        serial = entry.get("USB Serial Number") or entry.get("kUSBSerialNumberString")
++        serial_number = serial.strip() if isinstance(serial, str) and serial.strip() else None
++        identity = (entry.get("locationID"), serial_number)
++        if identity in seen:
++            continue
++        seen.add(identity)
++        found.append(
++            _PcanUsbProFd(
++                name=PCAN_USB_PRO_FD_NAME,
++                vendor_id=vendor_id,
++                product_id=product_id,
++                serial_number=serial_number,
++            )
++        )
++    return tuple(found)
++
++
++def _list_pcan_usb_pro_fd() -> tuple[_PcanUsbProFd, ...]:
++    """List PEAK PCAN-USB Pro FD adapters from the macOS USB registry."""
++    try:
++        result = subprocess.run(
++            ["ioreg", "-p", "IOUSB", "-l", "-a", "-w", "0"],
++            check=False,
++            capture_output=True,
++            timeout=10,
++        )
++    except (FileNotFoundError, subprocess.TimeoutExpired):
++        return ()
++    if result.returncode != 0 or not result.stdout:
++        return ()
++    try:
++        tree = plistlib.loads(result.stdout)
++    except (plistlib.InvalidFileException, ValueError):
++        return ()
++    return pcan_usb_pro_fd_from_ioreg(tree)
++
++
++def _echo_pcan_usb_pro_fd(devices: tuple[_PcanUsbProFd, ...]) -> None:
++    typer.echo("NAME                           USB ID     SERIAL     CHANNEL")
++    for device in devices:
++        usb_id = f"{device.vendor_id:04X}:{device.product_id:04X}"
++        serial = device.serial_number or "<missing>"
++        for channel in PCAN_USB_PRO_FD_CHANNELS:
++            typer.echo(f"{device.name:<30} {usb_id:<10} {serial:<10} {channel}")
++    typer.echo(
++        "OpenArm cannot open PEAK PCAN-USB on macOS yet. "
++        "--left-can-port/--right-can-port still need gs_usb serials, or Linux can0/can1 "
++        "after peak_usb. See docs/capabilities/manipulation/openarm_integration.md.",
++        err=True,
++    )
+ 
+ 
+ def _run_ip(*args: str, privileged: bool = False) -> subprocess.CompletedProcess[str]:
+@@ -64,27 +164,38 @@ def list_devices() -> None:
+         typer.echo(output or "No SocketCAN interfaces found")
+         return
+     if sys.platform == "darwin":
++        gs_usb_error: can_motor_control.TransportError | None = None
+         try:
+-            devices = can_motor_control.list_gs_usb_devices(
++            gs_usb_devices = can_motor_control.list_gs_usb_devices(
+                 vendor_id=GS_USB_VENDOR_ID,
+                 product_id=GS_USB_PRODUCT_ID,
+             )
+         except can_motor_control.TransportError as exc:
+-            typer.echo(f"CAN device discovery failed: {exc}", err=True)
+-            raise typer.Exit(1) from exc
+-        if not devices:
+-            typer.echo("No gs_usb adapters found (expected USB ID 1d50:606f)")
+-            return
+-        typer.echo("INDEX  SERIAL")
+-        for device in devices:
+-            typer.echo(f"{device.index:<5}  {device.serial_number or '<missing>'}")
+-        serials = [device.serial_number for device in devices]
+-        if not all(serials) or len(serials) != len(set(serials)):
++            gs_usb_error = exc
++            gs_usb_devices = []
++        pcan_devices = _list_pcan_usb_pro_fd()
++        if not gs_usb_devices and not pcan_devices:
++            if gs_usb_error is not None:
++                typer.echo(f"CAN device discovery failed: {gs_usb_error}", err=True)
++                raise typer.Exit(1) from gs_usb_error
+             typer.echo(
+-                "Adapters cannot be assigned reliably unless their firmware exposes "
+-                "unique, non-empty USB serials.",
+-                err=True,
++                "No CAN adapters found (expected gs_usb 1d50:606f or "
++                "PEAK PCAN-USB Pro FD 0C72:0011)"
+             )
++            return
++        if gs_usb_devices:
++            typer.echo("INDEX  SERIAL")
++            for device in gs_usb_devices:
++                typer.echo(f"{device.index:<5}  {device.serial_number or '<missing>'}")
++            serials = [device.serial_number for device in gs_usb_devices]
++            if not all(serials) or len(serials) != len(set(serials)):
++                typer.echo(
++                    "Adapters cannot be assigned reliably unless their firmware exposes "
++                    "unique, non-empty USB serials.",
++                    err=True,
++                )
++        if pcan_devices:
++            _echo_pcan_usb_pro_fd(pcan_devices)
+         return
+     typer.echo(f"CAN discovery is unsupported on {sys.platform}", err=True)
+     raise typer.Exit(1)
+diff --git a/dimos/cli/test_can.py b/dimos/cli/test_can.py
+index 55538ea4..bf72d223 100644
+--- a/dimos/cli/test_can.py
++++ b/dimos/cli/test_can.py
+@@ -56,6 +56,7 @@ def test_list_linux_can_interfaces(mocker: MockerFixture) -> None:
+ 
+ def test_list_macos_gs_usb_serials(mocker: MockerFixture) -> None:
+     mocker.patch("dimos.cli.can.sys.platform", "darwin")
++    mocker.patch("dimos.cli.can._list_pcan_usb_pro_fd", return_value=())
+     list_gs_usb = mocker.patch.object(
+         sys.modules["can_motor_control"],
+         "list_gs_usb_devices",
+@@ -77,6 +78,7 @@ def test_list_macos_gs_usb_serials(mocker: MockerFixture) -> None:
+ 
+ def test_list_macos_warns_about_missing_serial(mocker: MockerFixture) -> None:
+     mocker.patch("dimos.cli.can.sys.platform", "darwin")
++    mocker.patch("dimos.cli.can._list_pcan_usb_pro_fd", return_value=())
+     mocker.patch.object(
+         sys.modules["can_motor_control"],
+         "list_gs_usb_devices",
+@@ -93,6 +95,7 @@ def test_list_macos_warns_about_missing_serial(mocker: MockerFixture) -> None:
+ 
+ def test_list_macos_reports_discovery_error(mocker: MockerFixture) -> None:
+     mocker.patch("dimos.cli.can.sys.platform", "darwin")
++    mocker.patch("dimos.cli.can._list_pcan_usb_pro_fd", return_value=())
+     mocker.patch.object(
+         sys.modules["can_motor_control"],
+         "list_gs_usb_devices",
+@@ -106,6 +109,90 @@ def test_list_macos_reports_discovery_error(mocker: MockerFixture) -> None:
+     assert "CAN device discovery failed: USB unavailable" in result.stderr
+ 
+ 
++def test_list_macos_pcan_usb_pro_fd_channels(mocker: MockerFixture) -> None:
++    from dimos.cli.can import _PcanUsbProFd
++
++    mocker.patch("dimos.cli.can.sys.platform", "darwin")
++    mocker.patch.object(
++        sys.modules["can_motor_control"],
++        "list_gs_usb_devices",
++        create=True,
++        return_value=[],
++    )
++    mocker.patch(
++        "dimos.cli.can._list_pcan_usb_pro_fd",
++        return_value=(
++            _PcanUsbProFd(
++                name="PEAK-System PCAN-USB Pro FD",
++                vendor_id=0x0C72,
++                product_id=0x0011,
++                serial_number=None,
++            ),
++        ),
++    )
++
++    result = _invoke_can(["list"])
++
++    assert result.exit_code == 0, result.output
++    assert "PEAK-System PCAN-USB Pro FD" in result.stdout
++    assert "0C72:0011" in result.stdout
++    assert "PCAN_USBBUS1" in result.stdout
++    assert "PCAN_USBBUS2" in result.stdout
++    assert "cannot open PEAK PCAN-USB on macOS" in result.stderr
++
++
++def test_list_macos_pcan_survives_gs_usb_error(mocker: MockerFixture) -> None:
++    from dimos.cli.can import _PcanUsbProFd
++
++    mocker.patch("dimos.cli.can.sys.platform", "darwin")
++    mocker.patch.object(
++        sys.modules["can_motor_control"],
++        "list_gs_usb_devices",
++        create=True,
++        side_effect=sys.modules["can_motor_control"].TransportError("USB unavailable"),
++    )
++    mocker.patch(
++        "dimos.cli.can._list_pcan_usb_pro_fd",
++        return_value=(
++            _PcanUsbProFd(
++                name="PEAK-System PCAN-USB Pro FD",
++                vendor_id=0x0C72,
++                product_id=0x0011,
++                serial_number=None,
++            ),
++        ),
++    )
++
++    result = _invoke_can(["list"])
++
++    assert result.exit_code == 0, result.output
++    assert "0C72:0011" in result.stdout
++
++
++def test_pcan_usb_pro_fd_from_ioreg_reads_dual_channel_device() -> None:
++    from dimos.cli.can import pcan_usb_pro_fd_from_ioreg
++
++    devices = pcan_usb_pro_fd_from_ioreg(
++        {
++            "IORegistryEntryChildren": [
++                {
++                    "idVendor": 0x0C72,
++                    "idProduct": 0x0011,
++                    "USB Product Name": "PCAN-USB Pro FD",
++                    "USB Vendor Name": "PEAK-System Technik GmbH",
++                    "locationID": 1245184,
++                }
++            ]
++        }
++    )
++
++    assert len(devices) == 1
++    assert devices[0].name == "PEAK-System PCAN-USB Pro FD"
++    assert devices[0].vendor_id == 0x0C72
++    assert devices[0].product_id == 0x0011
++    assert devices[0].serial_number is None
++
++
+ def test_setup_valid_options_configures_and_verifies_can_interface(
+     mocker: MockerFixture,
+ ) -> None:
+diff --git a/dimos/imitation/README.md b/dimos/imitation/README.md
+index 995f3729..813f4dfc 100644
+--- a/dimos/imitation/README.md
++++ b/dimos/imitation/README.md
+@@ -51,9 +51,20 @@ prints one line per transition:
+ ~/.local/state/dimos/recordings/session_<robot>_<YYYYMMDD_HHMMSS>.db
+ ```
+ 
+-A new timestamped file per run (nothing is overwritten). It records three
+-streams: `color_image`, `coordinator_joint_state`, and `status` (the episode
+-start/save/discard markers).
++A new timestamped file per run (nothing is overwritten). XArm/Piper record
++`color_image`, `coordinator_joint_state`, and `status`. OpenArm additionally
++records the left/right commanded poses, both gripper commands, and named
++left-wrist, right-wrist, and top-camera images. Every message keeps its source
++timestamp and reception timestamp; DataPrep aligns them onto the fixed-rate
++LeRobot timeline.
++
++For OpenArm, run `learning-collect-quest-openarm` and query the recorder's
++`capture_status` RPC before accepting a take. It reports count and freshness for
++every required stream plus the current three-camera skew. A take is complete
++only when `all_required_advancing` is true. Camera producers must publish the
++three canonical names (`left_wrist_image`, `right_wrist_image`, and
++`top_camera_image`); the collection blueprint does not open camera devices on
++its own because the Render camera wall may already own them.
+ 
+ The exact path is printed when the recorder starts — note it for the next step.
+ 
+diff --git a/dimos/imitation/collection/blueprint.py b/dimos/imitation/collection/blueprint.py
+index 0f5c519c..a8a2e08d 100644
+--- a/dimos/imitation/collection/blueprint.py
++++ b/dimos/imitation/collection/blueprint.py
+@@ -29,10 +29,15 @@ from dimos.core.global_config import global_config
+ from dimos.hardware.sensors.camera.realsense.camera import RealSenseCamera
+ from dimos.imitation.collection.episode_monitor import EpisodeMonitorModule
+ from dimos.imitation.collection.recorder import CollectionRecorder
++from dimos.robot.manipulators.openarm.blueprints.teleop import (
++    OpenArmTeleopCoordinator,
++    teleop_quest_openarm,
++)
+ from dimos.teleop.quest.blueprints import (
+     teleop_quest_piper,
+     teleop_quest_xarm7,
+ )
++from dimos.teleop.quest.quest_extensions import ArmTeleopModule
+ 
+ 
+ def _session_db(robot: str) -> str:
+@@ -76,3 +81,35 @@ learning_collect_quest_piper = autoconnect(
+     teleop_quest_piper,
+     *_camera_if_real(),
+ )
++
++
++# OpenArm uses three named cameras. Camera producer modules are intentionally
++# supplied by the deployment (direct Pi devices or a camera-gateway bridge), so
++# starting this blueprint never steals devices from the existing camera wall.
++# The recorder's capture_status RPC makes any missing producer explicit.
++learning_collect_quest_openarm = autoconnect(
++    CollectionRecorder.blueprint(
++        db_path=_session_db("openarm"),
++        poseless_streams=[
++            "left_commanded_action",
++            "right_commanded_action",
++            "coordinator_joint_state",
++            "left_gripper_command",
++            "right_gripper_command",
++            "left_wrist_image",
++            "right_wrist_image",
++            "top_camera_image",
++            "status",
++        ],
++        record_tf=False,
++    ),
++    EpisodeMonitorModule.blueprint(default_task_label="openarm_teleop"),
++    teleop_quest_openarm,
++).remappings(
++    [
++        (ArmTeleopModule, "left_controller_output", "left_commanded_action"),
++        (ArmTeleopModule, "right_controller_output", "right_commanded_action"),
++        (OpenArmTeleopCoordinator, "left_gripper_command", "left_gripper_command"),
++        (OpenArmTeleopCoordinator, "right_gripper_command", "right_gripper_command"),
++    ]
++)
+diff --git a/dimos/imitation/collection/openarm_dataprep.json b/dimos/imitation/collection/openarm_dataprep.json
+new file mode 100644
+index 00000000..7313da4b
+--- /dev/null
++++ b/dimos/imitation/collection/openarm_dataprep.json
+@@ -0,0 +1,45 @@
++{
++  "source": "data/recordings/session_openarm.db",
++  "episodes": {
++    "extractor": "episode_status",
++    "status_stream": "status"
++  },
++  "observation": {
++    "left_wrist": {"stream": "left_wrist_image", "field": "data"},
++    "right_wrist": {"stream": "right_wrist_image", "field": "data"},
++    "top": {"stream": "top_camera_image", "field": "data"},
++    "joint_state": {"stream": "coordinator_joint_state", "field": "position"}
++  },
++  "action": {
++    "left_x": {"stream": "left_commanded_action", "field": "x"},
++    "left_y": {"stream": "left_commanded_action", "field": "y"},
++    "left_z": {"stream": "left_commanded_action", "field": "z"},
++    "left_qx": {"stream": "left_commanded_action", "field": "orientation.x"},
++    "left_qy": {"stream": "left_commanded_action", "field": "orientation.y"},
++    "left_qz": {"stream": "left_commanded_action", "field": "orientation.z"},
++    "left_qw": {"stream": "left_commanded_action", "field": "orientation.w"},
++    "right_x": {"stream": "right_commanded_action", "field": "x"},
++    "right_y": {"stream": "right_commanded_action", "field": "y"},
++    "right_z": {"stream": "right_commanded_action", "field": "z"},
++    "right_qx": {"stream": "right_commanded_action", "field": "orientation.x"},
++    "right_qy": {"stream": "right_commanded_action", "field": "orientation.y"},
++    "right_qz": {"stream": "right_commanded_action", "field": "orientation.z"},
++    "right_qw": {"stream": "right_commanded_action", "field": "orientation.w"},
++    "left_gripper": {"stream": "left_gripper_command", "field": "data"},
++    "right_gripper": {"stream": "right_gripper_command", "field": "data"}
++  },
++  "sync": {
++    "anchor": "top",
++    "rate_hz": 14.0,
++    "tolerance_ms": 80.0,
++    "action_shift": 0
++  },
++  "output": {
++    "format": "lerobot",
++    "path": "data/datasets/openarm_session",
++    "metadata": {
++      "robot": "openarm",
++      "default_task_label": "openarm_teleop"
++    }
++  }
++}
+diff --git a/dimos/imitation/collection/recorder.py b/dimos/imitation/collection/recorder.py
+index 6379464d..ad06730d 100644
+--- a/dimos/imitation/collection/recorder.py
++++ b/dimos/imitation/collection/recorder.py
+@@ -25,12 +25,30 @@ and `coordinator_joint_state` (observation), `status` (episode segmentation).
+ 
+ from __future__ import annotations
+ 
++import threading
++import time
++from typing import Any
++
++from dimos.core.core import rpc
+ from dimos.core.stream import In
+ from dimos.imitation.collection.episode_monitor import EpisodeStatus
+ from dimos.memory.module import Recorder, RecorderConfig
+ from dimos.msgs.geometry_msgs.Pose import Pose
++from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+ from dimos.msgs.sensor_msgs.Image import Image
+ from dimos.msgs.sensor_msgs.JointState import JointState
++from dimos.msgs.std_msgs.Float32 import Float32
++
++REQUIRED_OPENARM_STREAMS = (
++    "left_commanded_action",
++    "right_commanded_action",
++    "coordinator_joint_state",
++    "left_gripper_command",
++    "right_gripper_command",
++    "left_wrist_image",
++    "right_wrist_image",
++    "top_camera_image",
++)
+ 
+ 
+ class CollectionRecorderConfig(RecorderConfig):
+@@ -38,14 +56,83 @@ class CollectionRecorderConfig(RecorderConfig):
+ 
+ 
+ class CollectionRecorder(Recorder):
+-    """Records the streams DataPrep consumes from a teleop session."""
++    """Records synchronized-capable imitation-learning source streams.
++
++    Streams retain their source timestamp independently. DataPrep performs the
++    fixed-rate nearest-sample alignment when exporting LeRobot, avoiding a
++    lossy second live recorder and preserving evidence about camera/joint skew.
++    """
+ 
+     config: CollectionRecorderConfig
+ 
++    # Legacy single-camera name retained for existing XArm/Piper blueprints.
+     color_image: In[Image]  # observation (camera)
+-    coordinator_joint_state: In[JointState]  # observation + action (measured/next state)
++    # OpenArm observation/action contract.
++    left_commanded_action: In[PoseStamped]
++    right_commanded_action: In[PoseStamped]
++    coordinator_joint_state: In[JointState]  # measured left + right + grippers
++    left_gripper_command: In[Float32]
++    right_gripper_command: In[Float32]
++    left_wrist_image: In[Image]
++    right_wrist_image: In[Image]
++    top_camera_image: In[Image]
+     status: In[EpisodeStatus]  # episode start/save/discard segmentation
+ 
++    def __init__(self, *args: Any, **kwargs: Any) -> None:
++        super().__init__(*args, **kwargs)
++        self._capture_lock = threading.Lock()
++        self._capture_counts: dict[str, int] = {}
++        self._capture_last_source_ts: dict[str, float] = {}
++        self._capture_last_reception_ts: dict[str, float] = {}
++
++    def _on_recorded(self, name: str, msg: Any, ts: float, reception_ts: float) -> None:
++        with self._capture_lock:
++            self._capture_counts[name] = self._capture_counts.get(name, 0) + 1
++            self._capture_last_source_ts[name] = ts
++            self._capture_last_reception_ts[name] = reception_ts
++
++    @rpc
++    def capture_status(self) -> dict[str, Any]:
++        """Live proof that every required stream is connected and advancing."""
++        now = time.time()
++        with self._capture_lock:
++            rows = {
++                name: {
++                    "count": self._capture_counts.get(name, 0),
++                    "source_age_ms": (
++                        round(max(0.0, now - self._capture_last_source_ts[name]) * 1000.0, 1)
++                        if name in self._capture_last_source_ts
++                        else None
++                    ),
++                    "reception_age_ms": (
++                        round(max(0.0, now - self._capture_last_reception_ts[name]) * 1000.0, 1)
++                        if name in self._capture_last_reception_ts
++                        else None
++                    ),
++                    "connected": getattr(self.inputs[name], "_transport", None) is not None,
++                }
++                for name in REQUIRED_OPENARM_STREAMS
++            }
++        advancing = all(
++            row["count"] > 0 and (row["reception_age_ms"] or 0) < 2000 for row in rows.values()
++        )
++        camera_source_ts = [
++            self._capture_last_source_ts[name]
++            for name in ("left_wrist_image", "right_wrist_image", "top_camera_image")
++            if name in self._capture_last_source_ts
++        ]
++        return {
++            "ok": True,
++            "recording_path": str(self.config.db_path),
++            "all_required_advancing": advancing,
++            "camera_skew_ms": (
++                round((max(camera_source_ts) - min(camera_source_ts)) * 1000.0, 1)
++                if len(camera_source_ts) == 3
++                else None
++            ),
++            "streams": rows,
++        }
++
+     async def _resolve_pose(self, name: str, msg: object, ts: float) -> Pose | None:
+         if name in self.config.poseless_streams:
+             return None
+diff --git a/dimos/imitation/collection/test_blueprint.py b/dimos/imitation/collection/test_blueprint.py
+index c517cbfd..cf0c3372 100644
+--- a/dimos/imitation/collection/test_blueprint.py
++++ b/dimos/imitation/collection/test_blueprint.py
+@@ -18,6 +18,7 @@ import pytest
+ 
+ from dimos.core.coordination.blueprints import Blueprint
+ from dimos.imitation.collection.blueprint import (
++    learning_collect_quest_openarm,
+     learning_collect_quest_piper,
+     learning_collect_quest_xarm7,
+ )
+@@ -91,3 +92,23 @@ def test_recorder_reads_aggregate_joint_state(blueprint: Blueprint) -> None:
+     assert streams[("collectionrecorder", AGGREGATE)] == AGGREGATE
+     assert streams[("ControlCoordinator", AGGREGATE)] == AGGREGATE
+     assert not [port for _instance, port in streams if port.endswith("_joints")]
++
++
++def test_openarm_collection_declares_complete_capture_contract() -> None:
++    recorder = next(
++        atom for atom in learning_collect_quest_openarm.blueprints if atom.module is CollectionRecorder
++    )
++    stream_names = {stream.name for stream in recorder.streams}
++
++    assert {
++        "left_commanded_action",
++        "right_commanded_action",
++        "coordinator_joint_state",
++        "left_gripper_command",
++        "right_gripper_command",
++        "left_wrist_image",
++        "right_wrist_image",
++        "top_camera_image",
++        "status",
++    } <= stream_names
++    assert recorder.kwargs["record_tf"] is False
+diff --git a/dimos/imitation/collection/test_recorder.py b/dimos/imitation/collection/test_recorder.py
+index b854c23f..8685f5a7 100644
+--- a/dimos/imitation/collection/test_recorder.py
++++ b/dimos/imitation/collection/test_recorder.py
+@@ -12,9 +12,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import threading
++
+ import pytest_mock
+ 
+-from dimos.imitation.collection.recorder import CollectionRecorder, CollectionRecorderConfig
++from dimos.imitation.collection.recorder import (
++    REQUIRED_OPENARM_STREAMS,
++    CollectionRecorder,
++    CollectionRecorderConfig,
++)
+ 
+ 
+ async def test_poseless_collection_stream_skips_pose_lookup(
+@@ -26,3 +32,25 @@ async def test_poseless_collection_stream_skips_pose_lookup(
+     pose = await CollectionRecorder._resolve_pose(recorder, "commands", object(), 1.0)
+ 
+     assert pose is None
++
++
++def test_capture_status_reports_missing_and_advancing_streams(
++    mocker: pytest_mock.MockerFixture,
++) -> None:
++    recorder = mocker.MagicMock(spec=CollectionRecorder)
++    recorder.config = CollectionRecorderConfig(db_path="episode.db")
++    recorder._capture_lock = threading.Lock()
++    recorder._capture_counts = {name: 2 for name in REQUIRED_OPENARM_STREAMS}
++    recorder._capture_last_source_ts = {name: 100.0 for name in REQUIRED_OPENARM_STREAMS}
++    recorder._capture_last_reception_ts = {name: 100.0 for name in REQUIRED_OPENARM_STREAMS}
++    recorder.inputs = {name: mocker.Mock(_transport=object()) for name in REQUIRED_OPENARM_STREAMS}
++    mocker.patch("dimos.imitation.collection.recorder.time.time", return_value=100.5)
++
++    status = CollectionRecorder.capture_status(recorder)
++
++    assert status["all_required_advancing"] is True
++    assert status["camera_skew_ms"] == 0.0
++    assert all(row["connected"] for row in status["streams"].values())
++
++    recorder._capture_counts["top_camera_image"] = 0
++    assert CollectionRecorder.capture_status(recorder)["all_required_advancing"] is False
+diff --git a/dimos/imitation/dataprep/core.py b/dimos/imitation/dataprep/core.py
+index 7db49cfc..a34110d9 100644
+--- a/dimos/imitation/dataprep/core.py
++++ b/dimos/imitation/dataprep/core.py
+@@ -150,10 +150,10 @@ def resolve_field(msg: Any, ref: StreamField) -> NDArray[Any]:
+     """
+     if ref.field is None:
+         value: Any = msg
+-    elif isinstance(msg, dict):
+-        value = msg[ref.field]
+     else:
+-        value = getattr(msg, ref.field)
++        value = msg
++        for part in ref.field.split("."):
++            value = value[part] if isinstance(value, dict) else getattr(value, part)
+ 
+     if isinstance(value, np.ndarray):
+         return value
+diff --git a/dimos/imitation/dataprep/test_core.py b/dimos/imitation/dataprep/test_core.py
+index 5e9492b7..e637d948 100644
+--- a/dimos/imitation/dataprep/test_core.py
++++ b/dimos/imitation/dataprep/test_core.py
+@@ -144,6 +144,22 @@ def test_resolve_field_dict_payload() -> None:
+     np.testing.assert_array_equal(arr, np.array([4, 5]))
+ 
+ 
++def test_resolve_field_nested_attribute() -> None:
++    @dataclass
++    class Orientation:
++        x: float
++
++    @dataclass
++    class Pose:
++        orientation: Orientation
++
++    arr = resolve_field(
++        Pose(orientation=Orientation(x=0.25)),
++        StreamField(stream="left_commanded_action", field="orientation.x"),
++    )
++    np.testing.assert_array_equal(arr, np.asarray(0.25))
++
++
+ def test_resolve_field_none_passthrough_ndarray() -> None:
+     src = np.arange(6).reshape(2, 3)
+     out = resolve_field(src, StreamField(stream="x", field=None))
+diff --git a/dimos/manipulation/visualization/viser/episode_review.py b/dimos/manipulation/visualization/viser/episode_review.py
+new file mode 100644
+index 00000000..90461416
+--- /dev/null
++++ b/dimos/manipulation/visualization/viser/episode_review.py
+@@ -0,0 +1,220 @@
++# Copyright 2025-2026 Dimensional Inc.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++
++from __future__ import annotations
++
++from collections import deque
++from collections.abc import Callable
++from dataclasses import asdict, dataclass, field
++from datetime import datetime, timezone
++from enum import Enum
++import json
++from typing import Any
++
++
++class EpisodePhase(str, Enum):
++    IDLE = "idle"
++    READINESS = "readiness"
++    RUNNING = "running"
++    REVIEW = "review"
++    LABELED = "labeled"
++    RESET_REQUIRED = "reset_required"
++
++
++class OperatorLabel(str, Enum):
++    PASS = "pass"
++    FAIL = "fail"
++    UNCERTAIN = "uncertain"
++    EXCLUDE = "exclude"
++
++
++class CameraStatus(str, Enum):
++    UNKNOWN = "unknown"
++    HEALTHY = "healthy"
++    DEGRADED = "degraded"
++    OFFLINE = "offline"
++
++
++DEFAULT_READINESS_GATES = (
++    "robot_connected",
++    "emergency_stop_ready",
++    "workspace_clear",
++    "cameras_online",
++    "policy_loaded",
++)
++
++
++@dataclass(frozen=True)
++class EpisodeEvent:
++    timestamp: str
++    category: str
++    message: str
++
++
++@dataclass(frozen=True)
++class CameraHealth:
++    status: CameraStatus = CameraStatus.UNKNOWN
++    detail: str = "No health report"
++
++
++@dataclass
++class EpisodeReviewRecord:
++    phase: EpisodePhase = EpisodePhase.IDLE
++    run_id: str = ""
++    policy: str = ""
++    readiness_gates: dict[str, bool | None] = field(
++        default_factory=lambda: {name: None for name in DEFAULT_READINESS_GATES}
++    )
++    camera_health: dict[str, CameraHealth] = field(default_factory=dict)
++    automatic_result: str = ""
++    automatic_confidence: float | None = None
++    automatic_reason: str = ""
++    operator_label: OperatorLabel | None = None
++    failure_reason: str = ""
++    operator_note: str = ""
++    created_at: str = ""
++    started_at: str = ""
++    completed_at: str = ""
++    labeled_at: str = ""
++    events: deque[EpisodeEvent] = field(default_factory=lambda: deque(maxlen=120))
++
++
++class EpisodeReviewStateMachine:
++    """Authoritative, bounded operator-review record for one robot episode.
++
++    The state machine records observations and labels only. It has no robot-command
++    callback and therefore cannot start, stop, or otherwise actuate hardware.
++    """
++
++    def __init__(
++        self,
++        *,
++        now: Callable[[], datetime] | None = None,
++        event_limit: int = 120,
++    ) -> None:
++        if event_limit < 1:
++            raise ValueError("event_limit must be positive")
++        self._now = now or (lambda: datetime.now(timezone.utc))
++        self._event_limit = event_limit
++        self.record = self._new_record()
++
++    def begin_readiness(self, run_id: str, policy: str) -> None:
++        if self.record.phase != EpisodePhase.IDLE:
++            raise ValueError(f"Cannot begin readiness from {self.record.phase.value}")
++        self.record = self._new_record()
++        self.record.phase = EpisodePhase.READINESS
++        self.record.run_id = self._bounded(run_id, 120)
++        self.record.policy = self._bounded(policy, 240)
++        self._add_event("run", f"Readiness opened for {self.record.run_id or 'unassigned run'}")
++
++    def set_readiness_gate(self, name: str, passed: bool | None) -> None:
++        if self.record.phase != EpisodePhase.READINESS:
++            raise ValueError("Readiness gates can only change during readiness")
++        gate = self._bounded(name, 80)
++        self.record.readiness_gates[gate] = passed
++        value = "pending" if passed is None else "pass" if passed else "fail"
++        self._add_event("readiness", f"{gate}: {value}")
++
++    def observe_running(self) -> None:
++        if self.record.phase != EpisodePhase.READINESS:
++            raise ValueError("A run can only be observed after readiness")
++        incomplete = [
++            name for name, passed in self.record.readiness_gates.items() if passed is not True
++        ]
++        if incomplete:
++            raise ValueError(f"Readiness gates are not all passed: {', '.join(incomplete)}")
++        self.record.phase = EpisodePhase.RUNNING
++        self.record.started_at = self._timestamp()
++        self._add_event("run", "Run observed as started")
++
++    def observe_automatic_result(
++        self,
++        result: str,
++        *,
++        confidence: float | None = None,
++        reason: str = "",
++    ) -> None:
++        if self.record.phase != EpisodePhase.RUNNING:
++            raise ValueError("An automatic result requires a running episode")
++        if confidence is not None and not 0.0 <= confidence <= 1.0:
++            raise ValueError("confidence must be between 0 and 1")
++        self.record.phase = EpisodePhase.REVIEW
++        self.record.automatic_result = self._bounded(result, 80)
++        self.record.automatic_confidence = confidence
++        self.record.automatic_reason = self._bounded(reason, 500)
++        self.record.completed_at = self._timestamp()
++        self._add_event("result", f"Automatic result: {self.record.automatic_result or 'unknown'}")
++
++    def label(
++        self,
++        label: OperatorLabel,
++        *,
++        failure_reason: str = "",
++        note: str = "",
++    ) -> None:
++        if self.record.phase != EpisodePhase.REVIEW:
++            raise ValueError("Operator labels are only accepted during review")
++        if label == OperatorLabel.FAIL and not failure_reason.strip():
++            raise ValueError("A failure reason is required for FAIL")
++        self.record.phase = EpisodePhase.LABELED
++        self.record.operator_label = label
++        self.record.failure_reason = self._bounded(failure_reason, 160)
++        self.record.operator_note = self._bounded(note, 1000)
++        self.record.labeled_at = self._timestamp()
++        self._add_event("label", f"Operator label: {label.value}")
++
++    def require_reset(self) -> None:
++        if self.record.phase != EpisodePhase.LABELED:
++            raise ValueError("Only a labeled episode can require reset")
++        self.record.phase = EpisodePhase.RESET_REQUIRED
++        self._add_event("run", "Episode finalized; reset required")
++
++    def reset(self) -> None:
++        if self.record.phase != EpisodePhase.RESET_REQUIRED:
++            raise ValueError("Reset is only allowed after finalization")
++        self.record = self._new_record()
++
++    def update_camera(self, name: str, status: CameraStatus, detail: str = "") -> None:
++        camera_name = self._bounded(name, 80)
++        camera = CameraHealth(status, self._bounded(detail, 240) or "No detail")
++        self.record.camera_health[camera_name] = camera
++        self._add_event("camera", f"{camera_name}: {status.value}")
++
++    def add_observation(self, category: str, message: str) -> None:
++        self._add_event(self._bounded(category, 40), self._bounded(message, 500))
++
++    def export_json(self) -> str:
++        payload = asdict(self.record)
++        payload["phase"] = self.record.phase.value
++        payload["operator_label"] = (
++            None if self.record.operator_label is None else self.record.operator_label.value
++        )
++        payload["camera_health"] = {
++            name: {"status": camera.status.value, "detail": camera.detail}
++            for name, camera in self.record.camera_health.items()
++        }
++        payload["events"] = [asdict(event) for event in self.record.events]
++        return json.dumps(payload, indent=2, sort_keys=True)
++
++    def _new_record(self) -> EpisodeReviewRecord:
++        return EpisodeReviewRecord(
++            created_at=self._timestamp(), events=deque(maxlen=self._event_limit)
++        )
++
++    def _add_event(self, category: str, message: str) -> None:
++        self.record.events.append(EpisodeEvent(self._timestamp(), category, message))
++
++    def _timestamp(self) -> str:
++        value = self._now()
++        if value.tzinfo is None:
++            value = value.replace(tzinfo=timezone.utc)
++        return value.astimezone(timezone.utc).isoformat()
++
++    @staticmethod
++    def _bounded(value: Any, limit: int) -> str:
++        return str(value).strip()[:limit]
+diff --git a/dimos/manipulation/visualization/viser/gui.py b/dimos/manipulation/visualization/viser/gui.py
+index 6e96f15a..50349ef2 100644
+--- a/dimos/manipulation/visualization/viser/gui.py
++++ b/dimos/manipulation/visualization/viser/gui.py
+@@ -16,7 +16,7 @@ from __future__ import annotations
+ 
+ from collections.abc import Callable, Mapping, Sequence
+ import math
+-from typing import TypeAlias, cast
++from typing import Any, TypeAlias, cast
+ 
+ from dimos.manipulation.planning.groups.models import PlanningGroup
+ from dimos.manipulation.planning.planners.roboplan_config import RoboPlanCartesianPathConfig
+@@ -30,6 +30,13 @@ from dimos.manipulation.visualization.operator import (
+     TargetEvaluationResult,
+ )
+ from dimos.manipulation.visualization.viser.config import ViserVisualizationConfig
++from dimos.manipulation.visualization.viser.episode_review import (
++    DEFAULT_READINESS_GATES,
++    CameraStatus,
++    EpisodePhase,
++    EpisodeReviewStateMachine,
++    OperatorLabel,
++)
+ from dimos.manipulation.visualization.viser.runtime import VISER_INSTALL_HINT
+ from dimos.manipulation.visualization.viser.scene import (
+     RobotDisplayMode,
+@@ -135,6 +142,9 @@ class ViserPanelGui:
+         self._suppress_target_callbacks = False
+         self._default_group_initialized = False
+         self._handles: dict[str, PanelHandle] = {}
++        self._operator_tabs: Any | None = None
++        self._operator_tab_handles: list[Any] = []
++        self.episode_review = EpisodeReviewStateMachine()
+         self._joint_sliders: dict[tuple[PlanningGroupID, str], GuiSliderHandle[float]] = {}
+         self._worker = TargetEvaluationWorker(
+             self._handle_target_evaluation_request,
+@@ -167,8 +177,25 @@ class ViserPanelGui:
+             self.scene.cancel_preview_animation()
+         self._worker.stop()
+         self._operation_worker.stop(timeout=2.0)
+-        self._clear_joint_sliders()
+-        self._remove_panel_handles()
++        if self._operator_tabs is not None:
++            for key in [key for key in self._handles if key.startswith("ee_control:")]:
++                handle = self._handles.pop(key)
++                remove = getattr(handle, "remove", None)
++                if callable(remove):
++                    remove()
++            for tab in self._operator_tab_handles:
++                tab.remove()
++            self._operator_tab_handles.clear()
++            self._operator_tabs.remove()
++            self._operator_tabs = None
++            panel_folder = self._handles.get("panel_folder")
++            if panel_folder is not None:
++                panel_folder.remove()
++            self._joint_sliders.clear()
++            self._handles.clear()
++        else:
++            self._clear_joint_sliders()
++            self._remove_panel_handles()
+         self._handles.clear()
+         self.state.runtime = PanelRuntime.STOPPED
+ 
+@@ -332,13 +359,268 @@ class ViserPanelGui:
+         self._sync_preset_dropdown()
+         self._update_status_text()
+         self._update_control_state()
++        self._update_episode_review_ui()
+ 
+     def _build(self) -> None:
+         gui = self.server.gui
+         folder = gui.add_folder("Manipulation Panel", expand_by_default=True)
+         self._handles["panel_folder"] = folder
+         with folder:
+-            self._build_panel_controls(gui)
++            tabs = gui.add_tab_group()
++            self._operator_tabs = tabs
++            operate_tab = tabs.add_tab("Operate")
++            cameras_tab = tabs.add_tab("Cameras")
++            review_tab = tabs.add_tab("Review")
++            diagnostics_tab = tabs.add_tab("Diagnostics")
++            self._operator_tab_handles = [
++                operate_tab,
++                cameras_tab,
++                review_tab,
++                diagnostics_tab,
++            ]
++            with operate_tab:
++                self._build_episode_operate_controls(gui)
++                self._build_panel_controls(gui)
++            with cameras_tab:
++                self._build_episode_camera_controls(gui)
++            with review_tab:
++                self._build_episode_review_controls(gui)
++            with diagnostics_tab:
++                self._build_episode_diagnostics_controls(gui)
++
++    def _build_episode_operate_controls(self, gui: GuiApi) -> None:
++        self._handles["episode_status"] = gui.add_markdown("### Episode evaluation")
++        self._handles["episode_run_id"] = gui.add_text("Run ID", "")
++        self._handles["episode_policy"] = gui.add_text("Policy", "")
++        prepare = gui.add_button(
++            "Prepare episode review",
++            hint="Creates an observational record. This does not command the robot.",
++        )
++        prepare.on_click(lambda _: self._prepare_episode_review())
++        self._handles["episode_prepare"] = prepare
++        readiness = gui.add_folder("Readiness checks", expand_by_default=True)
++        self._handles["episode_readiness_folder"] = readiness
++        with readiness:
++            for gate in DEFAULT_READINESS_GATES:
++                handle = gui.add_dropdown(
++                    gate.replace("_", " ").title(),
++                    options=("Pending", "Pass", "Fail"),
++                    initial_value="Pending",
++                    disabled=True,
++                )
++                handle.on_update(
++                    lambda event, readiness_gate=gate: self._set_episode_readiness(
++                        readiness_gate, event.target.value
++                    )
++                )
++                self._handles[f"episode_gate:{gate}"] = handle
++        started = gui.add_button(
++            "Mark run started",
++            disabled=True,
++            hint="Records observed state only; no robot command is issued.",
++        )
++        started.on_click(lambda _: self._observe_episode_started())
++        self._handles["episode_started"] = started
++        stopped = gui.add_button(
++            "Mark run stopped / review",
++            disabled=True,
++            hint="Moves the record to review only; no robot command is issued.",
++        )
++        stopped.on_click(lambda _: self._observe_episode_stopped())
++        self._handles["episode_stopped"] = stopped
++
++    def _build_episode_camera_controls(self, gui: GuiApi) -> None:
++        self._handles["episode_cameras"] = gui.add_markdown("### Camera health")
++        for name in ("workspace", "wrist"):
++            folder = gui.add_folder(f"{name.title()} camera", expand_by_default=True)
++            self._handles[f"episode_camera_folder:{name}"] = folder
++            with folder:
++                self._handles[f"episode_camera:{name}"] = gui.add_markdown(
++                    "Image stream not connected. Use `update_episode_camera()` to publish health."
++                )
++
++    def _build_episode_review_controls(self, gui: GuiApi) -> None:
++        self._handles["episode_review_summary"] = gui.add_markdown("### Episode review")
++        failure = gui.add_dropdown(
++            "Failure reason",
++            options=(
++                "Select reason...",
++                "Policy / planning",
++                "Grasp / contact",
++                "Perception",
++                "Robot / controller",
++                "Safety stop",
++                "Camera / recording",
++                "Environment / setup",
++                "Other",
++            ),
++            initial_value="Select reason...",
++            disabled=True,
++        )
++        self._handles["episode_failure_reason"] = failure
++        self._handles["episode_note"] = gui.add_text(
++            "Operator note", "", multiline=True, disabled=True
++        )
++        for label in OperatorLabel:
++            button = gui.add_button(label.value.upper(), disabled=True)
++            button.on_click(lambda _, selected=label: self._label_episode(selected))
++            self._handles[f"episode_label:{label.value}"] = button
++        finalize = gui.add_button("Finalize label", disabled=True)
++        finalize.on_click(lambda _: self._finalize_episode_label())
++        self._handles["episode_finalize"] = finalize
++        reset = gui.add_button("Reset for next run", disabled=True)
++        reset.on_click(lambda _: self._reset_episode_review())
++        self._handles["episode_reset"] = reset
++
++    def _build_episode_diagnostics_controls(self, gui: GuiApi) -> None:
++        self._handles["episode_diagnostics"] = gui.add_markdown("### Bounded event log")
++        self._handles["episode_export"] = gui.add_text(
++            "Episode record JSON",
++            self.episode_review.export_json(),
++            multiline=True,
++            disabled=True,
++            hint="Select and copy this bounded record for diagnostics or dataset metadata.",
++        )
++        refresh_export = gui.add_button("Refresh export")
++        refresh_export.on_click(lambda _: self._refresh_episode_export())
++        self._handles["episode_refresh_export"] = refresh_export
++
++    def _prepare_episode_review(self) -> None:
++        run_id = str(self._handle_value("episode_run_id"))
++        policy = str(self._handle_value("episode_policy"))
++        try:
++            self.episode_review.begin_readiness(run_id, policy)
++        except ValueError as error:
++            self.episode_review.add_observation("ui", str(error))
++        self._update_episode_review_ui()
++
++    def _set_episode_readiness(self, gate: str, value: str) -> None:
++        result = {"Pending": None, "Pass": True, "Fail": False}.get(str(value))
++        try:
++            self.episode_review.set_readiness_gate(gate, result)
++        except ValueError as error:
++            self.episode_review.add_observation("ui", str(error))
++        self._update_episode_review_ui()
++
++    def _observe_episode_started(self) -> None:
++        try:
++            self.episode_review.observe_running()
++        except ValueError as error:
++            self.episode_review.add_observation("ui", str(error))
++        self._update_episode_review_ui()
++
++    def _observe_episode_stopped(self) -> None:
++        try:
++            self.episode_review.observe_automatic_result(
++                "awaiting_operator", reason="Run marked stopped in Viser"
++            )
++        except ValueError as error:
++            self.episode_review.add_observation("ui", str(error))
++        self._update_episode_review_ui()
++
++    def _label_episode(self, label: OperatorLabel) -> None:
++        failure_reason = str(self._handle_value("episode_failure_reason"))
++        if failure_reason == "Select reason...":
++            failure_reason = ""
++        note = str(self._handle_value("episode_note"))
++        try:
++            self.episode_review.label(label, failure_reason=failure_reason, note=note)
++        except ValueError as error:
++            self.episode_review.add_observation("ui", str(error))
++        self._update_episode_review_ui()
++
++    def _finalize_episode_label(self) -> None:
++        try:
++            self.episode_review.require_reset()
++        except ValueError as error:
++            self.episode_review.add_observation("ui", str(error))
++        self._update_episode_review_ui()
++
++    def _reset_episode_review(self) -> None:
++        try:
++            self.episode_review.reset()
++        except ValueError as error:
++            self.episode_review.add_observation("ui", str(error))
++        self._update_episode_review_ui()
++
++    def update_episode_camera(self, name: str, status: CameraStatus, detail: str = "") -> None:
++        """Update health shown in the Viser Cameras tab without controlling hardware."""
++        self.episode_review.update_camera(name, status, detail)
++        self._update_episode_review_ui()
++
++    def observe_episode_automatic_result(
++        self, result: str, *, confidence: float | None = None, reason: str = ""
++    ) -> None:
++        """Publish a policy evaluator result into the operator review workflow."""
++        self.episode_review.observe_automatic_result(result, confidence=confidence, reason=reason)
++        self._update_episode_review_ui()
++
++    def _update_episode_review_ui(self) -> None:
++        record = self.episode_review.record
++        gates_passed = sum(value is True for value in record.readiness_gates.values())
++        gates_total = len(record.readiness_gates)
++        self._set_handle_value(
++            "episode_status",
++            "### Episode evaluation\n\n"
++            f"**Phase:** `{record.phase.value}`  \n"
++            f"**Run:** `{record.run_id or 'not assigned'}`  \n"
++            f"**Policy:** `{record.policy or 'not selected'}`  \n"
++            f"**Readiness:** `{gates_passed}/{gates_total} passed`",
++        )
++        readiness = record.phase == EpisodePhase.READINESS
++        for gate in DEFAULT_READINESS_GATES:
++            self._set_disabled(f"episode_gate:{gate}", not readiness)
++        self._set_disabled("episode_prepare", record.phase != EpisodePhase.IDLE)
++        all_gates_passed = bool(record.readiness_gates) and all(
++            value is True for value in record.readiness_gates.values()
++        )
++        self._set_disabled("episode_started", not readiness or not all_gates_passed)
++        self._set_disabled("episode_stopped", record.phase != EpisodePhase.RUNNING)
++        camera_lines = ["### Camera health"]
++        if not record.camera_health:
++            camera_lines.append("No camera telemetry has been published.")
++        for name, camera in sorted(record.camera_health.items()):
++            camera_lines.append(f"- **{name}:** `{camera.status.value}` — {camera.detail}")
++            self._set_handle_value(
++                f"episode_camera:{name}",
++                f"**Health:** `{camera.status.value}`  \n{camera.detail}\n\nImage/frustum stream placeholder",
++            )
++        self._set_handle_value("episode_cameras", "\n\n".join(camera_lines))
++        confidence = (
++            "not reported"
++            if record.automatic_confidence is None
++            else f"{record.automatic_confidence:.0%}"
++        )
++        self._set_handle_value(
++            "episode_review_summary",
++            "### Episode review\n\n"
++            f"**Automatic result:** `{record.automatic_result or 'pending'}`  \n"
++            f"**Confidence:** `{confidence}`  \n"
++            f"**Reason:** {record.automatic_reason or 'Not reported'}  \n"
++            f"**Operator label:** `{record.operator_label.value if record.operator_label else 'pending'}`",
++        )
++        reviewing = record.phase == EpisodePhase.REVIEW
++        self._set_disabled("episode_failure_reason", not reviewing)
++        self._set_disabled("episode_note", not reviewing)
++        for label in OperatorLabel:
++            self._set_disabled(f"episode_label:{label.value}", not reviewing)
++        self._set_disabled("episode_finalize", record.phase != EpisodePhase.LABELED)
++        self._set_disabled("episode_reset", record.phase != EpisodePhase.RESET_REQUIRED)
++        event_lines = ["### Bounded event log"]
++        event_lines.extend(
++            f"`{event.timestamp}` **{event.category}** — {event.message}" for event in record.events
++        )
++        if not record.events:
++            event_lines.append("No events recorded.")
++        self._set_handle_value("episode_diagnostics", "\n\n".join(event_lines))
++        self._refresh_episode_export()
++
++    def _refresh_episode_export(self) -> None:
++        self._set_handle_value("episode_export", self.episode_review.export_json())
++
++    def _handle_value(self, key: str) -> Any:
++        handle = self._handles.get(key)
++        return "" if handle is None else getattr(handle, "value", "")
+ 
+     def _build_panel_controls(self, gui: GuiApi) -> None:
+         self._handles["status"] = gui.add_markdown("### Status\n**State:** Ready")
+@@ -1379,6 +1661,8 @@ class ViserPanelGui:
+     def _set_handle_value(self, key: str, value: str) -> None:
+         handle = self._handles.get(key)
+         if isinstance(handle, GuiMarkdownHandle):
++            self._set_optional_handle_attr(handle, "content", value)
++        elif handle is not None and hasattr(handle, "value"):
+             self._set_optional_handle_attr(handle, "value", value)
+ 
+     def _set_disabled(self, key: str, disabled: bool) -> None:
+diff --git a/dimos/manipulation/visualization/viser/preview_episode_review.py b/dimos/manipulation/visualization/viser/preview_episode_review.py
+new file mode 100644
+index 00000000..527e404a
+--- /dev/null
++++ b/dimos/manipulation/visualization/viser/preview_episode_review.py
+@@ -0,0 +1,74 @@
++# Copyright 2025-2026 Dimensional Inc.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++
++"""Launch the manipulation panel with a no-op backend for browser review.
++
++Run with:
++    uv run python -m dimos.manipulation.visualization.viser.preview_episode_review
++
++This harness has no physical robot transport and every operator method is inert.
++"""
++
++from pathlib import Path
++import threading
++
++from viser import ViserServer
++
++from dimos.manipulation.planning.spec.config import RobotModelConfig
++from dimos.manipulation.planning.spec.models import PlanningSceneInfo
++from dimos.manipulation.visualization.operator import OperatorStatus
++from dimos.manipulation.visualization.viser.config import ViserVisualizationConfig
++from dimos.manipulation.visualization.viser.episode_review import CameraStatus
++from dimos.manipulation.visualization.viser.gui import ViserPanelGui
++from dimos.manipulation.visualization.viser.theme import apply_dimos_theme
++from dimos.robot.assets.model import RobotModel
++
++
++class NoOpOperator:
++    """Minimum read-only operator contract for the safe UI preview."""
++
++    def status(self) -> OperatorStatus:
++        return OperatorStatus(state="IDLE", error="", has_plan=False)
++
++    def get_init_joints(self) -> None:
++        return None
++
++    def get_motion_speed(self) -> float:
++        return 1.0
++
++
++def main() -> None:
++    server = ViserServer(port=8080)
++    apply_dimos_theme(server)
++    panel = ViserPanelGui(
++        server,
++        PlanningSceneInfo(
++            model=RobotModelConfig(
++                model=RobotModel.from_file(Path("/tmp/viser-review-preview.urdf")),
++                joint_names=[],
++            )
++        ),
++        NoOpOperator(),
++        lambda: None,
++        ViserVisualizationConfig(),
++    )
++    panel.start()
++    panel.update_episode_camera("workspace", CameraStatus.HEALTHY, "Preview source · 30 fps")
++    panel.update_episode_camera("wrist", CameraStatus.DEGRADED, "Preview source · low light")
++    print("Safe Viser review preview: http://127.0.0.1:8080")
++    try:
++        threading.Event().wait()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        panel.close()
++        server.stop()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/dimos/manipulation/visualization/viser/test_episode_review.py b/dimos/manipulation/visualization/viser/test_episode_review.py
+new file mode 100644
+index 00000000..7084607d
+--- /dev/null
++++ b/dimos/manipulation/visualization/viser/test_episode_review.py
+@@ -0,0 +1,126 @@
++# Copyright 2025-2026 Dimensional Inc.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++
++from datetime import datetime, timedelta, timezone
++import json
++
++import pytest
++
++from dimos.manipulation.visualization.viser.episode_review import (
++    CameraStatus,
++    EpisodePhase,
++    EpisodeReviewStateMachine,
++    OperatorLabel,
++)
++
++
++class Clock:
++    def __init__(self) -> None:
++        self._value = datetime(2026, 9, 29, tzinfo=timezone.utc)
++
++    def __call__(self) -> datetime:
++        value = self._value
++        self._value += timedelta(seconds=1)
++        return value
++
++
++def test_episode_review_captures_run_evidence_and_operator_label() -> None:
++    review = EpisodeReviewStateMachine(now=Clock())
++
++    review.begin_readiness("run-42", "openarm/pick-cup")
++    for gate in review.record.readiness_gates:
++        review.set_readiness_gate(gate, True)
++    review.update_camera("wrist", CameraStatus.HEALTHY, "30 fps")
++    review.observe_running()
++    review.observe_automatic_result(
++        "task_complete", confidence=0.91, reason="Object reached goal region"
++    )
++    review.label(OperatorLabel.PASS, note="Clean placement")
++
++    assert review.record.phase == EpisodePhase.LABELED
++    assert review.record.run_id == "run-42"
++    assert review.record.policy == "openarm/pick-cup"
++    assert review.record.camera_health["wrist"].status == CameraStatus.HEALTHY
++    assert review.record.automatic_confidence == 0.91
++    assert review.record.operator_label == OperatorLabel.PASS
++    assert review.record.started_at < review.record.completed_at < review.record.labeled_at
++
++
++def test_fail_requires_taxonomy_reason_and_only_review_accepts_labels() -> None:
++    review = EpisodeReviewStateMachine(now=Clock())
++
++    with pytest.raises(ValueError, match="only accepted during review"):
++        review.label(OperatorLabel.PASS)
++
++    review.begin_readiness("run-1", "policy")
++    for gate in review.record.readiness_gates:
++        review.set_readiness_gate(gate, True)
++    review.observe_running()
++    review.observe_automatic_result("failed")
++
++    with pytest.raises(ValueError, match="failure reason is required"):
++        review.label(OperatorLabel.FAIL)
++
++    review.label(OperatorLabel.FAIL, failure_reason="Grasp / contact")
++    assert review.record.failure_reason == "Grasp / contact"
++
++
++def test_finalize_and_reset_preserve_labeled_record_until_operator_reset() -> None:
++    review = EpisodeReviewStateMachine(now=Clock())
++    review.begin_readiness("run-1", "policy")
++    for gate in review.record.readiness_gates:
++        review.set_readiness_gate(gate, True)
++    review.observe_running()
++    review.observe_automatic_result("unknown")
++    review.label(OperatorLabel.UNCERTAIN)
++
++    review.require_reset()
++
++    assert review.record.phase == EpisodePhase.RESET_REQUIRED
++    assert review.record.operator_label == OperatorLabel.UNCERTAIN
++
++    review.reset()
++
++    assert review.record.phase == EpisodePhase.IDLE
++    assert review.record.run_id == ""
++
++
++def test_event_log_is_bounded_and_export_is_machine_readable() -> None:
++    review = EpisodeReviewStateMachine(now=Clock(), event_limit=3)
++    review.begin_readiness("run-1", "policy")
++
++    for index in range(5):
++        review.add_observation("button", f"clicked {index}")
++
++    payload = json.loads(review.export_json())
++
++    assert len(payload["events"]) == 3
++    assert [event["message"] for event in payload["events"]] == [
++        "clicked 2",
++        "clicked 3",
++        "clicked 4",
++    ]
++    assert payload["phase"] == "readiness"
++
++
++def test_running_requires_every_readiness_gate_and_finalized_record_cannot_be_replaced() -> None:
++    review = EpisodeReviewStateMachine(now=Clock())
++    review.begin_readiness("run-1", "policy")
++
++    with pytest.raises(ValueError, match="Readiness gates are not all passed"):
++        review.observe_running()
++
++    for gate in review.record.readiness_gates:
++        review.set_readiness_gate(gate, True)
++    review.observe_running()
++    review.observe_automatic_result("complete")
++    review.label(OperatorLabel.PASS)
++    review.require_reset()
++
++    with pytest.raises(ValueError, match="Cannot begin readiness from reset_required"):
++        review.begin_readiness("run-2", "policy")
+diff --git a/dimos/manipulation/visualization/viser/test_gui.py b/dimos/manipulation/visualization/viser/test_gui.py
+index 1ca1faab..7fbfa67d 100644
+--- a/dimos/manipulation/visualization/viser/test_gui.py
++++ b/dimos/manipulation/visualization/viser/test_gui.py
+@@ -26,7 +26,9 @@ from dimos.manipulation.planning.groups.models import PlanningGroup
+ from dimos.manipulation.planning.spec.config import RobotModelConfig
+ from dimos.manipulation.planning.spec.models import GeneratedPlan, PlanningSceneInfo
+ from dimos.manipulation.visualization.operator import OperatorStatus, TargetEvaluationResult
++from dimos.manipulation.visualization.viser import gui as gui_module
+ from dimos.manipulation.visualization.viser.config import ViserVisualizationConfig
++from dimos.manipulation.visualization.viser.episode_review import OperatorLabel
+ from dimos.manipulation.visualization.viser.gui import ViserPanelGui
+ from dimos.manipulation.visualization.viser.state import (
+     ActionStatus,
+@@ -474,3 +476,54 @@ def test_gui_ignores_stale_timed_out_operation_finish() -> None:
+ 
+     assert gui.state.action_status == ActionStatus.FAILED
+     assert gui.state.error == "Operation timed out after 5.0s"
++
++
++def test_episode_review_controls_only_enable_labels_during_review(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    gui = make_gui()
++    disabled: dict[str, bool] = {}
++    monkeypatch.setattr(gui, "_set_disabled", disabled.__setitem__)
++    monkeypatch.setattr(gui, "_set_handle_value", lambda _key, _value: None)
++    monkeypatch.setattr(gui, "_refresh_episode_export", lambda: None)
++
++    gui.episode_review.begin_readiness("run-9", "openarm/pick")
++    gui._update_episode_review_ui()
++
++    assert disabled["episode_started"] is True
++    assert disabled["episode_label:pass"] is True
++
++    for gate in gui.episode_review.record.readiness_gates:
++        gui.episode_review.set_readiness_gate(gate, True)
++    gui._update_episode_review_ui()
++
++    assert disabled["episode_started"] is False
++
++    gui.episode_review.observe_running()
++    gui.episode_review.observe_automatic_result("task_complete", confidence=0.8)
++    gui._update_episode_review_ui()
++
++    assert disabled["episode_started"] is True
++    assert disabled["episode_label:pass"] is False
++    assert disabled["episode_label:fail"] is False
++
++    gui.episode_review.label(OperatorLabel.PASS)
++    gui._update_episode_review_ui()
++
++    assert disabled["episode_label:pass"] is True
++    assert disabled["episode_finalize"] is False
++
++
++def test_markdown_updates_use_viser_content_property(monkeypatch: pytest.MonkeyPatch) -> None:
++    gui = make_gui()
++
++    class FakeMarkdown:
++        content = "old"
++
++    monkeypatch.setattr(gui_module, "GuiMarkdownHandle", FakeMarkdown)
++    handle = FakeMarkdown()
++    gui._handles["status"] = handle
++
++    gui._set_handle_value("status", "new status")
++
++    assert handle.content == "new status"
+diff --git a/dimos/memory/module.py b/dimos/memory/module.py
+index 4293b561..24b94816 100644
+--- a/dimos/memory/module.py
++++ b/dimos/memory/module.py
+@@ -423,11 +423,20 @@ class Recorder(MemoryModule):
+                     getattr(msg, "ts", None),
+                 )
+             stream.append(msg, ts=ts, pose=pose, tags={"reception_ts": recv_ts})
++            self._on_recorded(name, msg, ts, recv_ts)
+ 
+         # Stamp arrival time before the coalescing dispatch queue.
+         stamped = input_topic.pure_observable().pipe(ops.map(lambda msg: (time.time(), msg)))
+         self.process_observable(stamped, on_msg)
+ 
++    def _on_recorded(self, name: str, msg: Any, ts: float, reception_ts: float) -> None:
++        """Observe a successful append without adding another subscription.
++
++        Recorder subclasses can override this to expose lightweight live health
++        information.  The default deliberately does nothing so recording stays
++        the single source of truth for message counts and timestamps.
++        """
++
+     def _prepare_streams(self) -> None:
+         """On APPEND, drop the streams this recorder is about to (re)write — the
+         remapped In-port streams plus ``tf`` — so a re-run replaces them instead
+diff --git a/dimos/robot/all_blueprints.py b/dimos/robot/all_blueprints.py
+index c92c90c3..c5dc2666 100644
+--- a/dimos/robot/all_blueprints.py
++++ b/dimos/robot/all_blueprints.py
+@@ -316,6 +316,7 @@ all_modules = {
+     "static-tf-publisher": "dimos.protocol.tf.static_tf_publisher.StaticTfPublisher",
+     "teleop-control-coordinator": "dimos.control.teleop_coordinator.TeleopControlCoordinator",
+     "teleop-recorder": "dimos.teleop.utils.recorder.TeleopRecorder",
++    "learning-collect-quest-openarm": "dimos.imitation.collection.blueprint.learning_collect_quest_openarm",
+     "temporal-memory": "dimos.perception.experimental.temporal_memory.temporal_memory.TemporalMemory",
+     "twist-teleop-module": "dimos.teleop.quest.quest_extensions.TwistTeleopModule",
+     "unitree-g1-skill-container": "dimos.robot.unitree.g1.skill_container.UnitreeG1SkillContainer",
+diff --git a/dimos/teleop/quest/web/static/index.html b/dimos/teleop/quest/web/static/index.html
+index b23a8362..a447e027 100644
+--- a/dimos/teleop/quest/web/static/index.html
++++ b/dimos/teleop/quest/web/static/index.html
+@@ -4,18 +4,31 @@
+     <meta charset="UTF-8">
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+     <title>Quest 3 VR Teleop</title>
+-    <link rel="stylesheet" href="/static/teleop.css">
++    <link rel="stylesheet" href="/static/teleop.css?v=20260908-engage1-20260909-voice1">
+ </head>
+ <body>
+     <div id="ui">
+         <h1>DimOS Quest-3 Teleop</h1>
+         <div id="status">Ready to connect</div>
++        <p class="hint">
++            Connect enters passthrough. Hold <strong>X</strong> (left) and
++            <strong>A</strong> (right) — the HUD should switch to
++            <strong>ENGAGED</strong>. This page is Quest + Rerun only: no robot
++            arm until you run <code>teleop-quest-xarm7</code> or piper. Close
++            this tab and reopen the URL after an update.
++        </p>
++        <p class="hint voice-hint" id="voiceHint">
++            Quest <strong>Hey Meta</strong> cannot click these web buttons.
++            In-app voice: say <strong>Connect</strong> or <strong>Disconnect</strong>.
++            Engage is still hold X + A.
++        </p>
+         <button id="connectBtn" onclick="connect()">Connect</button>
+         <button id="disconnectBtn" class="disconnect hidden" onclick="disconnect()">Disconnect</button>
++        <button id="voiceBtn" type="button" aria-pressed="false">Listen</button>
+     </div>
+     <canvas id="canvas"></canvas>
+     <img id="videoFeed" style="display:none" crossorigin="anonymous"/>
+ 
+-    <script type="module" src="/static/teleop.js"></script>
++    <script type="module" src="/static/teleop.js?v=20260908-engage1-20260909-voice1"></script>
+ </body>
+ </html>
+diff --git a/dimos/teleop/quest/web/static/teleop-voice.js b/dimos/teleop/quest/web/static/teleop-voice.js
+new file mode 100644
+index 00000000..6acb27bb
+--- /dev/null
++++ b/dimos/teleop/quest/web/static/teleop-voice.js
+@@ -0,0 +1,25 @@
++/**
++ * In-app voice for Quest teleop. Quest OS “Hey Meta” cannot target
++ * arbitrary web buttons on this page or in Studio WebXR.
++ */
++
++export function speechRecognitionCtor(win = typeof window !== "undefined" ? window : globalThis) {
++  return win.SpeechRecognition || win.webkitSpeechRecognition || null;
++}
++
++export function matchTeleopVoicePhrase(text) {
++  const t = String(text || "")
++    .toLowerCase()
++    .replace(/[^\w\s+]/g, " ")
++    .replace(/\s+/g, " ")
++    .trim();
++  if (!t) return null;
++  if (/\b(disconnect|stop vr|end session|exit vr)\b/.test(t)) return "disconnect";
++  if (/\b(connect|enter vr|start vr|start teleop)\b/.test(t)) return "connect";
++  if (/\b(disengage|release engage)\b/.test(t)) return "engage-hint";
++  if (/\b(engage|hold x|hold a)\b/.test(t)) return "engage-hint";
++  return null;
++}
++
++export const TELEOP_VOICE_HINT =
++  'Quest “Hey Meta” cannot click these buttons. In-app voice: say “Connect” or “Disconnect”. Engage is still hold X + A.';
+diff --git a/dimos/teleop/quest/web/static/teleop-voice.test.js b/dimos/teleop/quest/web/static/teleop-voice.test.js
+new file mode 100644
+index 00000000..c91c805c
+--- /dev/null
++++ b/dimos/teleop/quest/web/static/teleop-voice.test.js
+@@ -0,0 +1,12 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { matchTeleopVoicePhrase, TELEOP_VOICE_HINT } from "./teleop-voice.js";
++
++test("teleop in-app voice maps connect/disconnect, not Hey Meta", () => {
++  assert.equal(matchTeleopVoicePhrase("hey connect please"), "connect");
++  assert.equal(matchTeleopVoicePhrase("Disconnect"), "disconnect");
++  assert.equal(matchTeleopVoicePhrase("engage now"), "engage-hint");
++  assert.equal(matchTeleopVoicePhrase("open youtube"), null);
++  assert.match(TELEOP_VOICE_HINT, /Hey Meta/);
++  assert.match(TELEOP_VOICE_HINT, /Connect/);
++});
+diff --git a/dimos/teleop/quest/web/static/teleop.css b/dimos/teleop/quest/web/static/teleop.css
+index 701dd04d..8b95edeb 100644
+--- a/dimos/teleop/quest/web/static/teleop.css
++++ b/dimos/teleop/quest/web/static/teleop.css
+@@ -29,6 +29,50 @@ body {
+     z-index: 100;
+ }
+ 
++.hint {
++    max-width: 28em;
++    margin: 0 24px 28px;
++    font-size: 20px;
++    line-height: 1.4;
++    color: #5c6570;
++    text-align: center;
++}
++
++body.xr-active {
++    background: transparent;
++}
++
++body.xr-active #ui {
++    top: 6%;
++    left: 50%;
++    width: min(92vw, 720px);
++    height: auto;
++    transform: translateX(-50%);
++    padding: 22px 24px 26px;
++    background: rgba(8, 14, 24, 0.84);
++    border: 1px solid rgba(188, 210, 235, 0.28);
++    border-radius: 18px;
++    justify-content: flex-start;
++}
++
++body.xr-active h1 {
++    color: #f4f7fb;
++    font-size: 28px;
++    margin-bottom: 16px;
++}
++
++body.xr-active #status {
++    background: rgba(255, 255, 255, 0.08);
++    border-color: #63d6a3;
++    color: #8de2bd;
++}
++
++body.xr-active .hint {
++    color: #c0cfdf;
++    font-size: 18px;
++    margin-bottom: 18px;
++}
++
+ h1 {
+     font-size: 42px;
+     font-weight: 600;
+@@ -75,6 +119,21 @@ button.disconnect {
+     margin-top: 16px;
+ }
+ 
++#voiceBtn {
++    margin-top: 16px;
++    background-color: #0f766e;
++}
++
++#voiceBtn[aria-pressed="true"] {
++    background-color: #155e75;
++    outline: 3px solid #7ee8ff;
++}
++
++.voice-hint {
++    max-width: 32em;
++    margin-top: 0;
++}
++
+ button.disconnect:hover {
+     background-color: #545b62;
+ }
+diff --git a/dimos/teleop/quest/web/static/teleop.js b/dimos/teleop/quest/web/static/teleop.js
+index 21f48b30..e8ed112a 100644
+--- a/dimos/teleop/quest/web/static/teleop.js
++++ b/dimos/teleop/quest/web/static/teleop.js
+@@ -5,6 +5,7 @@ window.onerror = (msg, url, line, col, error) => {
+ };
+ 
+ import { geometry_msgs, std_msgs, sensor_msgs } from "https://esm.sh/jsr/@dimos/msgs@0.1.4";
++import { matchTeleopVoicePhrase, speechRecognitionCtor, TELEOP_VOICE_HINT } from "./teleop-voice.js?v=20260909-voice1";
+ 
+ // WebSocket and VR state
+ let ws = null;
+@@ -30,14 +31,16 @@ let prevBlobUrl = null;  // revoked when the next-next blob arrives
+ const videoModelMatrix = new Float32Array(16);
+ const hudModelMatrix = new Float32Array(16);
+ const hudLocalMatrix = new Float32Array(16);
++const headHudModelMatrix = new Float32Array(16);
++const headHudLocalMatrix = new Float32Array(16);
+ 
+ const PANEL_POS_X = 0.0;
+ const PANEL_POS_Y = 1.4;   // ~eye height
+ const PANEL_POS_Z = -1.5;  // 1.5m in front of starting position
+ const PANEL_HEIGHT = 0.9;
+ 
+-// Collection HUD state. The panel is anchored below the initial headset pose
+-// and remains fixed in the local-floor scene.
++// Collection HUD state. One copy is world-locked near the start pose; a second
++// copy is head-locked every frame so CONNECTED / HOLD X+A stays in view.
+ let episodeStatus = null;
+ let episodeStatusReceivedAtMs = 0;
+ let hudOffline = false;
+@@ -47,13 +50,21 @@ let hudTexture = null;
+ let hudDirty = false;
+ let hudElapsedSecond = -1;
+ let hudPlaced = false;
++let lastLeftTrackMs = 0;
++let lastRightTrackMs = 0;
++let leftPrimaryHeld = false;
++let rightPrimaryHeld = false;
+ 
+ const HUD_WIDTH_PX = 2048;
+-const HUD_HEIGHT_PX = 256;
+-const HUD_WIDTH_METERS = 1.08;
++const HUD_HEIGHT_PX = 440;
++const HUD_WIDTH_METERS = 1.7;
+ const HUD_HEIGHT_METERS = HUD_WIDTH_METERS * HUD_HEIGHT_PX / HUD_WIDTH_PX;
+-const HUD_OFFSET_Y = -0.6;
+-const HUD_OFFSET_Z = -1.2;
++const HUD_OFFSET_Y = -0.18;
++const HUD_OFFSET_Z = -0.85;
++const HEAD_HUD_WIDTH_METERS = 0.92;
++const HEAD_HUD_HEIGHT_METERS = HEAD_HUD_WIDTH_METERS * HUD_HEIGHT_PX / HUD_WIDTH_PX;
++const HEAD_HUD_OFFSET_Y = -0.08;
++const HEAD_HUD_OFFSET_Z = -0.55;
+ 
+ // UI elements
+ const statusEl = document.getElementById('status');
+@@ -311,6 +322,14 @@ function initCollectionHud() {
+         HUD_OFFSET_Y,
+         HUD_OFFSET_Z,
+     );
++    setModelMatrix(
++        headHudLocalMatrix,
++        HEAD_HUD_WIDTH_METERS * 0.5,
++        HEAD_HUD_HEIGHT_METERS * 0.5,
++        0,
++        HEAD_HUD_OFFSET_Y,
++        HEAD_HUD_OFFSET_Z,
++    );
+ }
+ 
+ function placeCollectionHud(pose) {
+@@ -318,6 +337,10 @@ function placeCollectionHud(pose) {
+     hudPlaced = true;
+ }
+ 
++function placeHeadLockedHud(pose) {
++    multiplyMatrices(headHudModelMatrix, pose.transform.matrix, headHudLocalMatrix);
++}
++
+ function drawHudSection(
+     context,
+     x,
+@@ -329,30 +352,30 @@ function drawHudSection(
+ ) {
+     if (x > 24) {
+         context.fillStyle = 'rgba(178, 196, 219, 0.22)';
+-        context.fillRect(x, 36, 2, HUD_HEIGHT_PX - 72);
++        context.fillRect(x, 48, 2, HUD_HEIGHT_PX - 96);
+     }
+ 
+     const left = x + 28;
+     context.fillStyle = '#c0cfdf';
+-    context.font = '700 27px sans-serif';
+-    context.fillText(label, left, 78);
++    context.font = '700 36px sans-serif';
++    context.fillText(label, left, 112);
+ 
+     let valueLeft = left;
+     if (dotColor) {
+         context.fillStyle = dotColor;
+         context.beginPath();
+-        context.arc(left + 10, 159, 10, 0, Math.PI * 2);
++        context.arc(left + 12, 232, 12, 0, Math.PI * 2);
+         context.fill();
+-        valueLeft += 34;
++        valueLeft += 40;
+     }
+     context.fillStyle = color;
+     const font = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+-    context.font = `600 43px ${font}`;
++    context.font = `700 62px ${font}`;
+     const availableWidth = x + width - valueLeft - 24;
+     const measuredWidth = context.measureText(value).width;
+-    const fontSize = Math.min(43, 43 * availableWidth / measuredWidth);
+-    context.font = `600 ${fontSize}px ${font}`;
+-    context.fillText(value, valueLeft, 174);
++    const fontSize = Math.min(62, 62 * availableWidth / measuredWidth);
++    context.font = `700 ${fontSize}px ${font}`;
++    context.fillText(value, valueLeft, 250);
+ }
+ 
+ function collectionElapsedSeconds() {
+@@ -367,35 +390,66 @@ function formatElapsed(seconds) {
+     return `${minutes}:${remainder}`;
+ }
+ 
++function trackingLabel(lastMs, primaryHeld) {
++    if (primaryHeld) return 'ENGAGED';
++    return lastMs && performance.now() - lastMs < 500 ? 'TRACKING' : '---';
++}
++
++function engageLabel() {
++    if (leftPrimaryHeld && rightPrimaryHeld) return 'ENGAGED';
++    if (leftPrimaryHeld) return 'LEFT X';
++    if (rightPrimaryHeld) return 'RIGHT A';
++    return 'HOLD X + A';
++}
++
++let lastHudLeft = '';
++let lastHudRight = '';
++let lastHudEngage = '';
++
+ function updateHudTexture() {
+-    if (!episodeStatus || !hudContext) return;
++    if (!hudContext) return;
+     const elapsed = collectionElapsedSeconds();
+-    if (!hudDirty && elapsed === hudElapsedSecond) return;
++    const left = trackingLabel(lastLeftTrackMs, leftPrimaryHeld);
++    const right = trackingLabel(lastRightTrackMs, rightPrimaryHeld);
++    const engage = engageLabel();
++    if (
++        !hudDirty &&
++        elapsed === hudElapsedSecond &&
++        left === lastHudLeft &&
++        right === lastHudRight &&
++        engage === lastHudEngage
++    ) {
++        return;
++    }
+     hudDirty = false;
+     hudElapsedSecond = elapsed;
+-
+-    const saved = episodeStatus.episodes_saved;
+-    const discarded = episodeStatus.episodes_discarded;
+-    const recording = episodeStatus.state === 'recording';
+-    const state = hudOffline ? 'OFFLINE' : recording ? 'RECORDING' : 'READY';
+-    const stateColor = hudOffline ? '#f6b94d' : recording ? '#ff6b6b' : '#63d6a3';
+-    const lastEvent = episodeStatus.last_event === 'init' ? 'NONE' : episodeStatus.last_event.toUpperCase();
+-    const sections = [
+-        [400, 'STATE', state, '#f4f7fb', stateColor],
+-        [220, 'TAKE', String(saved + discarded + 1).padStart(3, '0'), '#f4f7fb'],
++    lastHudLeft = left;
++    lastHudRight = right;
++    lastHudEngage = engage;
++
++    const engageColor = (leftPrimaryHeld || rightPrimaryHeld) ? '#7ee8ff' : '#8de2bd';
++    const sections = episodeStatus ? [
++        [400, 'STATE', hudOffline ? 'OFFLINE' : episodeStatus.state === 'recording' ? 'RECORDING' : 'READY', '#f4f7fb', hudOffline ? '#f6b94d' : episodeStatus.state === 'recording' ? '#ff6b6b' : '#63d6a3'],
++        [220, 'TAKE', String(episodeStatus.episodes_saved + episodeStatus.episodes_discarded + 1).padStart(3, '0'), '#f4f7fb'],
+         [280, 'ELAPSED', hudOffline ? '--:--' : formatElapsed(elapsed), '#f4f7fb'],
+-        [260, 'SAVED', String(saved).padStart(3, '0'), '#8de2bd'],
+-        [320, 'DISCARDED', String(discarded).padStart(3, '0'), '#f7c66d'],
+-        [568, 'LAST ACTION', lastEvent, '#f4f7fb'],
++        [260, 'SAVED', String(episodeStatus.episodes_saved).padStart(3, '0'), '#8de2bd'],
++        [320, 'DISCARDED', String(episodeStatus.episodes_discarded).padStart(3, '0'), '#f7c66d'],
++        [568, 'LAST ACTION', episodeStatus.last_event === 'init' ? 'NONE' : episodeStatus.last_event.toUpperCase(), '#f4f7fb'],
++    ] : [
++        [340, 'STATE', hudOffline ? 'OFFLINE' : 'CONNECTED', '#f4f7fb', hudOffline ? '#f6b94d' : '#63d6a3'],
++        [280, 'LEFT', left, left === 'ENGAGED' ? '#7ee8ff' : '#f4f7fb'],
++        [280, 'RIGHT', right, right === 'ENGAGED' ? '#7ee8ff' : '#f4f7fb'],
++        [420, 'ENGAGE', engage, engageColor],
++        [728, 'ROBOT', 'NONE — RERUN ONLY', '#f7c66d'],
+     ];
+ 
+     hudContext.clearRect(0, 0, HUD_WIDTH_PX, HUD_HEIGHT_PX);
+     hudContext.beginPath();
+-    hudContext.roundRect(8, 8, HUD_WIDTH_PX - 16, HUD_HEIGHT_PX - 16, 34);
+-    hudContext.fillStyle = 'rgba(4, 9, 17, 0.88)';
++    hudContext.roundRect(8, 8, HUD_WIDTH_PX - 16, HUD_HEIGHT_PX - 16, 40);
++    hudContext.fillStyle = 'rgba(4, 12, 28, 0.94)';
+     hudContext.fill();
+-    hudContext.strokeStyle = 'rgba(188, 210, 235, 0.35)';
+-    hudContext.lineWidth = 3;
++    hudContext.strokeStyle = 'rgba(80, 220, 255, 0.95)';
++    hudContext.lineWidth = 8;
+     hudContext.stroke();
+ 
+     let x = 0;
+@@ -404,6 +458,16 @@ function updateHudTexture() {
+         x += width;
+     }
+ 
++    if (!episodeStatus) {
++        hudContext.fillStyle = '#7ee8ff';
++        hudContext.font = '700 28px sans-serif';
++        hudContext.fillText(
++            'Tracking + engage only. No robot until you run teleop-quest-xarm7 / piper.',
++            36,
++            HUD_HEIGHT_PX - 28,
++        );
++    }
++
+     gl.bindTexture(gl.TEXTURE_2D, hudTexture);
+     gl.texImage2D(
+         gl.TEXTURE_2D,
+@@ -415,20 +479,28 @@ function updateHudTexture() {
+     );
+ }
+ 
+-function renderCollectionHud(view, viewport) {
+-    if (!episodeStatus || !hudPlaced) return;
++function renderHudQuad(view, viewport, modelMatrix) {
+     gl.enable(gl.BLEND);
+     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+     renderTexturedQuad(
+         view,
+         viewport,
+         hudTexture,
+-        hudModelMatrix,
++        modelMatrix,
+         view.transform.inverse.matrix,
+     );
+     gl.disable(gl.BLEND);
+ }
+ 
++function renderCollectionHud(view, viewport) {
++    if (!hudPlaced) return;
++    renderHudQuad(view, viewport, hudModelMatrix);
++}
++
++function renderHeadLockedHud(view, viewport) {
++    renderHudQuad(view, viewport, headHudModelMatrix);
++}
++
+ function sendPose(handedness, pose) {
+     const pos = pose.transform.position;
+     const rot = pose.transform.orientation;
+@@ -465,22 +537,89 @@ function sendJoy(handedness, axes, buttons) {
+     }
+ }
+ 
++function isButtonDown(button) {
++    return !!(button && (button.pressed || button.value > 0.5));
++}
++
++// DIMOS Joy buttons: [trigger, grip, touchpad, thumbstick, X/A, Y/B, menu].
++// Quest Browser does not always put X/A at raw index 4 — copy-by-index
++// left Python's primary (buttons[4]) stuck at 0 while X/A was at 2 or 3.
++function mapDimosController(gamepad) {
++    const raw = gamepad.buttons || [];
++    const n = raw.length;
++    const xr = gamepad.mapping === 'xr-standard';
++    const stickX = (xr ? gamepad.axes[2] : gamepad.axes[0]) ?? 0.0;
++    const stickY = (xr ? gamepad.axes[3] : gamepad.axes[1]) ?? 0.0;
++
++    let touchpad = false;
++    let thumbstick = false;
++    let primary = false;
++    let secondary = false;
++    let menu = false;
++
++    if (xr && n >= 6) {
++        touchpad = isButtonDown(raw[2]);
++        thumbstick = isButtonDown(raw[3]);
++        primary = isButtonDown(raw[4]);
++        secondary = isButtonDown(raw[5]);
++        menu = isButtonDown(raw[6]);
++    } else if (xr && n === 5) {
++        // Touchpad placeholder omitted: stick, X/A, Y/B shift left by one.
++        thumbstick = isButtonDown(raw[2]);
++        primary = isButtonDown(raw[3]);
++        secondary = isButtonDown(raw[4]);
++    } else {
++        // Oculus/Meta native: 0 trigger, 1 grip, 2 X/A, 3 Y/B, 4 stick, 5 menu.
++        primary = isButtonDown(raw[2]);
++        secondary = isButtonDown(raw[3]);
++        thumbstick = isButtonDown(raw[4]);
++        menu = isButtonDown(raw[5]) || isButtonDown(raw[6]);
++    }
++
++    if (!primary) {
++        primary = isButtonDown(raw[4]) || (!xr && isButtonDown(raw[2]));
++    }
++
++    return {
++        primary,
++        axes: [
++            stickX,
++            stickY,
++            raw[0]?.value ?? 0.0,
++            raw[1]?.value ?? 0.0,
++        ],
++        buttons: [
++            isButtonDown(raw[0]) ? 1 : 0,
++            isButtonDown(raw[1]) ? 1 : 0,
++            touchpad ? 1 : 0,
++            thumbstick ? 1 : 0,
++            primary ? 1 : 0,
++            secondary ? 1 : 0,
++            menu ? 1 : 0,
++        ],
++    };
++}
++
+ // Send raw controller and wrist tracking data (no processing - done in Python)
+ function processTracking(frame) {
+-    // Rate limit tracking data
+     const now = performance.now();
+-    if (now - lastSendTime < sendInterval) {
+-        return;
+-    }
+-    lastSendTime = now;
++    const shouldSend = now - lastSendTime >= sendInterval;
++    if (shouldSend) lastSendTime = now;
++
++    let sawLeftPrimary = false;
++    let sawRightPrimary = false;
+ 
+-    // Process controller and hand input sources.
+     for (const inputSource of frame.session.inputSources) {
+         const handedness = inputSource.handedness;
+         if (handedness !== 'left' && handedness !== 'right') continue;
+ 
++        const gamepad = inputSource.gamepad;
++        const looksLikeController = !!(gamepad && gamepad.buttons && gamepad.buttons.length >= 4);
+         const hand = inputSource.hand;
+-        if (hand) {
++
++        // Prefer controller gamepad over hand skeleton. Quest can attach
++        // both; the old path took `hand` first and never read X/A.
++        if (hand && !looksLikeController) {
+             const wristPose = frame.getJointPose(hand.get('wrist'), xrRefSpace);
+             const thumbTipPose = frame.getJointPose(hand.get('thumb-tip'), xrRefSpace);
+             const middleTipPose = frame.getJointPose(hand.get('middle-finger-tip'), xrRefSpace);
+@@ -494,13 +633,22 @@ function processTracking(frame) {
+                 thumb.z - middle.z,
+             ) < GRIPPER_PINCH_DISTANCE_METERS;
+ 
+-            sendPose(handedness, wristPose);
+-            // Index pinch selects arm tracking; middle pinch closes the gripper.
+-            sendJoy(
+-                handedness,
+-                [0, 0, gripperPinched ? 1 : 0, 0],
+-                [0, 0, 0, 0, handSelectActive.get(handedness) ? 1 : 0, 0, 0],
+-            );
++            const primary = !!handSelectActive.get(handedness);
++            if (handedness === 'left') {
++                lastLeftTrackMs = now;
++                sawLeftPrimary = sawLeftPrimary || primary;
++            } else {
++                lastRightTrackMs = now;
++                sawRightPrimary = sawRightPrimary || primary;
++            }
++            if (shouldSend) {
++                sendPose(handedness, wristPose);
++                sendJoy(
++                    handedness,
++                    [0, 0, gripperPinched ? 1 : 0, 0],
++                    [0, 0, 0, 0, primary ? 1 : 0, 0, 0],
++                );
++            }
+             continue;
+         }
+ 
+@@ -509,42 +657,24 @@ function processTracking(frame) {
+         const pose = frame.getPose(trackingSpace, xrRefSpace);
+         if (!pose) continue;
+ 
+-        sendPose(handedness, pose);
++        if (handedness === 'left') lastLeftTrackMs = now;
++        else lastRightTrackMs = now;
+ 
+-        // Send Joy message with all buttons and axes
+-        const gamepad = inputSource.gamepad;
+         if (gamepad) {
+-            const isXrStandard = gamepad.mapping === 'xr-standard';
+-            const stickX = (isXrStandard ? gamepad.axes[2] : gamepad.axes[0]) ?? 0.0;
+-            const stickY = (isXrStandard ? gamepad.axes[3] : gamepad.axes[1]) ?? 0.0;
+-            const axes = [
+-                stickX,
+-                stickY,
+-                gamepad.buttons[0]?.value ?? 0.0,
+-                gamepad.buttons[1]?.value ?? 0.0,
+-            ];
+-
+-            // Buttons layout (int32, 0 or 1):
+-            // [0] = trigger (digital)
+-            // [1] = grip (digital)
+-            // [2] = touchpad press
+-            // [3] = thumbstick press
+-            // [4] = X/A button
+-            // [5] = Y/B button
+-            // [6] = menu (if exposed)
+-            // Pad to at least 7 entries: the Python side
+-            // (QuestControllerState.from_joy) requires the full layout,
+-            // but browsers only report the buttons the controller has
+-            // (e.g. 6 when no menu/thumbrest is exposed).
+-            const buttons = [];
+-            const buttonCount = Math.max(gamepad.buttons.length, 7);
+-            for (let i = 0; i < buttonCount; i++) {
+-                buttons.push(gamepad.buttons[i]?.pressed ? 1 : 0);
++            const mapped = mapDimosController(gamepad);
++            if (handedness === 'left') sawLeftPrimary = sawLeftPrimary || mapped.primary;
++            else sawRightPrimary = sawRightPrimary || mapped.primary;
++            if (shouldSend) {
++                sendPose(handedness, pose);
++                sendJoy(handedness, mapped.axes, mapped.buttons);
+             }
+-
+-            sendJoy(handedness, axes, buttons);
++        } else if (shouldSend) {
++            sendPose(handedness, pose);
+         }
+     }
++
++    leftPrimaryHeld = sawLeftPrimary;
++    rightPrimaryHeld = sawRightPrimary;
+ }
+ 
+ // VR render loop
+@@ -568,10 +698,12 @@ function onXRFrame(_time, frame) {
+     const pose = frame.getViewerPose(xrRefSpace);
+     if (pose) {
+         if (!hudPlaced) placeCollectionHud(pose);
++        placeHeadLockedHud(pose);
+         for (const view of pose.views) {
+             const viewport = glLayer.getViewport(view);
+             if (videoReady) renderVideoPanel(view, viewport);
+             renderCollectionHud(view, viewport);
++            renderHeadLockedHud(view, viewport);
+         }
+     }
+ }
+@@ -583,25 +715,51 @@ async function startVR() {
+         initGL();
+         setStatus('Requesting VR session...');
+ 
+-        // Try immersive-ar first (true passthrough), fall back to immersive-vr
++        // Try immersive-ar with a DOM overlay so the HTML panel stays visible
++        // in passthrough. Fall back if the headset rejects overlay or AR.
++        const overlayRoot = document.getElementById('ui');
++        const sessionAttempts = [
++            {
++                mode: 'immersive-ar',
++                init: {
++                    requiredFeatures: ['local-floor'],
++                    optionalFeatures: ['hand-tracking', 'dom-overlay'],
++                    domOverlay: { root: overlayRoot },
++                },
++            },
++            {
++                mode: 'immersive-ar',
++                init: {
++                    requiredFeatures: ['local-floor'],
++                    optionalFeatures: ['hand-tracking'],
++                },
++            },
++            {
++                mode: 'immersive-vr',
++                init: {
++                    requiredFeatures: ['local-floor'],
++                    optionalFeatures: ['hand-tracking'],
++                },
++            },
++        ];
+         let session = null;
+-        try {
+-            session = await navigator.xr.requestSession('immersive-ar', {
+-                requiredFeatures: ['local-floor'],
+-                optionalFeatures: ['hand-tracking']
+-            });
+-            console.log('Started immersive-ar session (passthrough)');
+-        } catch (arError) {
+-            console.log('immersive-ar not available, trying immersive-vr');
+-            session = await navigator.xr.requestSession('immersive-vr', {
+-                requiredFeatures: ['local-floor'],
+-                optionalFeatures: ['hand-tracking']
+-            });
+-            console.log('Started immersive-vr session');
++        let lastXrError = null;
++        for (const attempt of sessionAttempts) {
++            try {
++                session = await navigator.xr.requestSession(attempt.mode, attempt.init);
++                console.log(`Started ${attempt.mode} session`);
++                break;
++            } catch (xrError) {
++                lastXrError = xrError;
++            }
++        }
++        if (!session) {
++            throw lastXrError || new Error('WebXR session was not created');
+         }
+ 
+         xrSession = session;
+         hudPlaced = false;
++        document.body.classList.add('xr-active');
+ 
+         // Setup WebGL layer
+         const glLayer = new XRWebGLLayer(session, gl);
+@@ -612,13 +770,18 @@ async function startVR() {
+         // Get reference space
+         xrRefSpace = await session.requestReferenceSpace('local-floor');
+ 
+-        setStatus('VR active');
++        setStatus('VR active — HUD is locked in front of your eyes');
+ 
+         // Session event handlers
+         session.addEventListener('end', () => {
++            document.body.classList.remove('xr-active');
+             setStatus('VR session ended');
+             handSelectActive.clear();
+             hudPlaced = false;
++            lastLeftTrackMs = 0;
++            lastRightTrackMs = 0;
++            leftPrimaryHeld = false;
++            rightPrimaryHeld = false;
+             xrSession = null;
+             window.disconnect();
+         });
+@@ -715,3 +878,78 @@ window.addEventListener('load', async () => {
+         console.error('WebXR check failed:', error);
+     }
+ });
++
++const voiceBtn = document.getElementById('voiceBtn');
++const voiceHintEl = document.getElementById('voiceHint');
++if (voiceHintEl) voiceHintEl.textContent = TELEOP_VOICE_HINT;
++
++let teleopVoiceRec = null;
++
++function applyTeleopVoiceAction(action) {
++    if (action === 'connect') {
++        setStatus('Voice: Connect');
++        window.connect?.();
++        return;
++    }
++    if (action === 'disconnect') {
++        setStatus('Voice: Disconnect');
++        window.disconnect?.();
++        return;
++    }
++    if (action === 'engage-hint') {
++        setStatus('Engage is hold X + A — voice cannot press Quest face buttons');
++    }
++}
++
++function stopTeleopVoice() {
++    const rec = teleopVoiceRec;
++    teleopVoiceRec = null;
++    if (rec) {
++        try { rec.onresult = null; rec.onerror = null; rec.onend = null; } catch { /* ignore */ }
++        try { rec.stop(); } catch { /* ignore */ }
++        try { rec.abort(); } catch { /* ignore */ }
++    }
++    voiceBtn?.setAttribute('aria-pressed', 'false');
++    if (voiceBtn) voiceBtn.textContent = 'Listen';
++}
++
++function startTeleopVoice() {
++    const SpeechRecognition = speechRecognitionCtor();
++    if (!SpeechRecognition) {
++        setStatus('In-app voice is not supported in this browser');
++        return;
++    }
++    stopTeleopVoice();
++    const rec = new SpeechRecognition();
++    rec.continuous = true;
++    rec.interimResults = false;
++    try { rec.lang = navigator.language || 'en-US'; } catch { /* ignore */ }
++    rec.onresult = (event) => {
++        const last = event.results[event.results.length - 1];
++        const text = last?.[0]?.transcript || '';
++        if (!last?.isFinal) return;
++        applyTeleopVoiceAction(matchTeleopVoicePhrase(text));
++    };
++    rec.onerror = (ev) => {
++        setStatus(`Voice: ${ev?.error || 'error'}`);
++        stopTeleopVoice();
++    };
++    rec.onend = () => {
++        if (teleopVoiceRec === rec) stopTeleopVoice();
++    };
++    teleopVoiceRec = rec;
++    voiceBtn?.setAttribute('aria-pressed', 'true');
++    if (voiceBtn) voiceBtn.textContent = 'Listening…';
++    try {
++        rec.start();
++        setStatus('Listening — say Connect or Disconnect');
++    } catch (err) {
++        setStatus('Voice failed: ' + (err?.message || err));
++        stopTeleopVoice();
++    }
++}
++
++voiceBtn?.addEventListener('click', () => {
++    if (teleopVoiceRec) stopTeleopVoice();
++    else startTeleopVoice();
++});
+diff --git a/docs/capabilities/manipulation/openarm_integration.md b/docs/capabilities/manipulation/openarm_integration.md
+index e110dd49..379b18a9 100644
+--- a/docs/capabilities/manipulation/openarm_integration.md
++++ b/docs/capabilities/manipulation/openarm_integration.md
+@@ -54,6 +54,16 @@ Linux assigns `can0`/`can1` in USB enumeration order. If the arms come up
+ swapped, exchange the two explicit CLI values. Supplying only one interface is
+ rejected so physical operation can never depend on USB/CAN enumeration defaults.
+ 
++`dimos hardware can list` on macOS reports gs_usb adapters (`1d50:606f`,
++selected by USB serial) and PEAK-System PCAN-USB Pro FD (`0C72:0011`). The Pro
++FD is dual-channel; listing shows `PCAN_USBBUS1` and `PCAN_USBBUS2`. Those
++names are not OpenArm `--left-can-port` / `--right-can-port` values on macOS:
++`can-motor-control` only opens gs_usb there, and opening PEAK requires PEAK's
++MacCAN/PCBUSB `PCANBasic` library plus a PCAN bus backend that dimOS does not
++ship. On Linux, load `peak_usb` so the two channels appear as SocketCAN `can0`
++and `can1`, then `dimos hardware can setup can0` / `can1` and pass those
++interface names.
++
+ ## Blueprints
+ 
+ | Blueprint | Contents |

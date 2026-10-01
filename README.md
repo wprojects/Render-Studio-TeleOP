@@ -2,6 +2,8 @@
 
 This is a repo for linking TeleOP controls from Dimensional's OS to Render Studio. Download and install this to link your robot to Render Studio VR.
 
+Recovering a crashed Pi? Start with [RECOVERY.md](RECOVERY.md). The repository now preserves the last September 29 Pi runtime and the uncommitted DimOS work from the prior two weeks.
+
 It is a **thin linking layer**, not a DimOS dump: setup notes, env placeholders, and a local Connect API. The robot stack is [DimOS](https://github.com/dimensionalOS/dimos) (clone it next to this folder). Licensed under MIT.
 
 **Connect the Pi LAN IP in Render VR Studio** using Render’s robotics configuration docs (source of truth):
