@@ -1,0 +1,38 @@
+{
+  "schema": "render-studio-pi-recovery/v1",
+  "captured_at": "2026-10-01",
+  "runnable_pi_base": {
+    "repository": "https://github.com/dimensionalOS/dimos.git",
+    "commit": "f2945fad060082dae0023f4f00cade270b097c13",
+    "source": "/Users/sam/Render-Studio/integrations/dimos"
+  },
+  "pi_runtime": {
+    "last_observed_version": "1.0.8",
+    "last_observed_at": "2026-09-29T20:38:03-05:00",
+    "hardware": "openarm_damiao",
+    "capabilities": [
+      "guarded_home",
+      "policy_runner",
+      "policy_cameras"
+    ],
+    "required_policy_cameras": [
+      "top",
+      "wrist_left",
+      "wrist_right"
+    ]
+  },
+  "archived_mac_worktree": {
+    "repository": "https://github.com/dimensionalOS/dimos.git",
+    "base_commit": "3d65f28cc7a3dbb8a68780fedda09e7dfe2b15e6",
+    "patch": "patches/dimos-working-tree.patch",
+    "file_count": 22,
+    "note": "Preserved separately because it does not share the runnable Pi base."
+  },
+  "safety": {
+    "contains_secrets": false,
+    "contains_recordings": false,
+    "starts_services": false,
+    "sends_robot_commands": false,
+    "physical_motion_verified": false
+  }
+}
